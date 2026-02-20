@@ -17,73 +17,66 @@ k = 3
 # -----------------------------
 np.random.seed(0)
 X_np = np.random.randint(0, 5, size=(m, d)).astype(np.float64)
-"""
- # OLD
-X  = pk.View([m, d], dtype=pk.double)
-Xn = pk.View([m], dtype=pk.double)
-D  = pk.View([m, m], dtype=pk.double)
-idx = pk.View([m, k+1], dtype=pk.int32)
-G  = pk.View([m, m], dtype=pk.int32)
-
-pk.deep_copy(X, X_np)
-"""
 
 X = X_np.copy()
-Xn = np.empty(m, dtype=pk.double)
-D = np.empty((m,m), dtype=pk.double)
-idx = np.empty((m, k+1), dtype=pk.int32)
-G = np.empty((m,m), dtype=pk.int32)
+Xn = np.empty(m, dtype=np.float64)
+D = np.empty((m,m), dtype=np.float64)
+idx = np.full((m, k+1), -1, dtype=np.int32)
+G = np.empty((m,m), dtype=np.int32)
+
+# for topk_row workunit
+    # Allocate outside the workunit — each row i gets its own k+1 scratch slots
+best_dist = np.full((m, k + 1), 1e300, dtype=np.float64)
 
 # -----------------------------
 # kernels
 # -----------------------------
 @pk.workunit
 def compute_norm(i, X, Xn, d):
-    s = 0.0
+    s: pk.float64 = 0.0
     for j in range(d):
         s += X[i][j] * X[i][j]
     Xn[i] = s
 
-
 @pk.workunit
-def compute_dist(i, j, X, Xn, D, d):
-    dot = 0.0
+def compute_dist(lin, X, Xn, D, d, m):
+    i: pk.int32 = lin // m
+    j: pk.int32 = lin % m
+    dot: pk.float64 = 0.0
     for t in range(d):
         dot += X[i][t] * X[j][t]
     D[i][j] = -2.0 * dot + Xn[i] + Xn[j]
 
 
 @pk.workunit
-def topk_row(i, D, idx, m, k):
-    best_dist = [1e300] * (k+1)
-    best_idx  = [-1] * (k+1)
-
+def topk_row(i, D, idx, m, k, best_dist):
+    j: pk.int32 = 0
     for j in range(m):
-        val = D[i][j]
+        val: pk.float64 = D[i][j]
 
-        # find worst slot
-        worst = 0
-        for t in range(1, k+1):
-            if best_dist[t] > best_dist[worst]:
+        # find the worst (largest distance) slot
+        worst: pk.int32 = 0
+        t: pk.int32 = 0
+        for t in range(1, k + 1):
+            if best_dist[i][t] > best_dist[i][worst]:
                 worst = t
 
-        if val < best_dist[worst]:
-            best_dist[worst] = val
-            best_idx[worst] = j
-
-    for t in range(k+1):
-        idx[i][t] = best_idx[t]
-
+        # replace worst slot if current distance is smaller
+        if val < best_dist[i][worst]:
+            best_dist[i][worst] = val
+            idx[i][worst] = j
 
 @pk.workunit
-def zero_G(i, j, G):
+def zero_G(lin, G, m):
+    i: pk.int32 = lin // m
+    j: pk.int32 = lin % m
     G[i][j] = 0
 
 
 @pk.workunit
 def build_G(i, idx, G, k):
     for t in range(k+1):
-        j = idx[i][t]
+        j: pk.int32 = idx[i][t]
         if j >= 0 and j != i:
             G[i][j] = 1
 
@@ -95,19 +88,26 @@ t0 = time.time()
 
 pk.parallel_for(m, compute_norm, X=X, Xn=Xn, d=d)
 
+pk.fence()
+
 pk.parallel_for(
-    pk.MDRangePolicy([0,0], [m,m]),
+    m*m,
     compute_dist,
-    X=X, Xn=Xn, D=D, d=d
+    X=X, Xn=Xn, D=D, d=d, m=m
 )
 
-pk.parallel_for(m, topk_row, D=D, idx=idx, m=m, k=k)
+pk.fence()
+
+pk.parallel_for(m, topk_row, D=D, idx=idx, m=m, k=k, best_dist=best_dist)
 
 pk.parallel_for(
-    pk.MDRangePolicy([0,0], [m,m]),
+    m*m,
     zero_G,
-    G=G
+    G=G,
+    m=m
 )
+
+pk.fence()
 
 pk.parallel_for(m, build_G, idx=idx, G=G, k=k)
 
@@ -119,12 +119,6 @@ t1 = time.time()
 # -----------------------------
 # copy back for display
 # -----------------------------
-
-"""
- # OLD 
- D_host = pk.deep_copy(np.zeros((m,m)), D)
- G_host = pk.deep_copy(np.zeros((m,m), dtype=np.int32), G)
-"""
 D_host = D.copy()
 G_host = G.copy()
 
@@ -136,5 +130,8 @@ print(D_host)
 
 print("\nkNN Graph")
 print(G_host)
+
+# print("\nNorms Squared")
+# print(Xn)
 
 print("\nExecution time:", (t1 - t0)*1000, "ms")
