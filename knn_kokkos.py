@@ -7,9 +7,9 @@ import math
 # -----------------------------
 # parameters
 # -----------------------------
-m = 10_000
-d = 7
-k = 4
+m = 12_000
+d = 70
+k = 2
 b = 32
 l = math.ceil(m / b)
 device = "cpu"          # ← change to "cuda" for GPU
@@ -74,16 +74,27 @@ def compute_dist_dblk(lin, X, Xn, Dloc, d, b, blknum, blksize):
     
 
 @pk.workunit
-def compute_dist_hblk(lin, X, Xn, Dloc, d, b, blksize, blknum):
-    off0: pk.int32 = lin //  blksize
-    off1: pk.int32 = lin %  blksize
-    i: pk.int32 = off0 + b * (blknum-1)
-    j: pk.int32 = off1 + b * blknum
-    dot: pk.float64 = 0.0
-    for t in range(d):
-        dot += X[i][t] * X[j][t]
-    Dloc[off1][off0] = -2.0 * dot + Xn[i] + Xn[j]
-    # Dloc[off1][off0] = i * 100 + j
+def compute_dist_hblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blksize, blknum):
+    # One team per j column. X[j][:] is fixed for the team's lifetime —
+    # X[j][t] held in a thread register, reused across all b i-iterations.
+    jm: pk.int32 = team_member.league_rank()
+    j: pk.int32 = jm + b * blknum
+
+    im: pk.int32 = 0
+    for im in range(b):
+        i: pk.int32 = im + b * (blknum - 1)
+
+        # d threads split the t-axis. All threads access X[i][0..d-1]
+        # and X[j][0..d-1] simultaneously — coalesced row reads.
+        def dot_product(t: int, acc: pk.Acc[pk.double]):
+            acc += X[i][t] * X[j][t]
+
+        dot: pk.float64 = pk.parallel_reduce(pk.TeamThreadRange(team_member, d), dot_product)
+
+        if team_member.team_rank() == 0:
+            Dloc[jm][im] = -2.0 * dot + Xn[i] + Xn[j]
+
+        team_member.team_barrier()
 
 @pk.workunit
 def merge_topk(i, Gdst, Gidx, Ldst, Lidx, k, offset):
@@ -228,9 +239,13 @@ Lidx.fill_(-1)
 Ldst.fill_(torch.finfo(torch.float64).max)
 pk.fence()
 
+
+#tD = time.time()
+#tL = []
+
 for i in range(1, l):
     blksize = m - b * i
-    pk.parallel_for(blksize*b, compute_dist_hblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b, blksize=blksize, blknum=i)
+    pk.parallel_for(pk.TeamPolicy(blksize, pk.AUTO), compute_dist_hblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b, blksize=blksize, blknum=i)
     pk.fence()
 
     # compute local kNN
@@ -246,6 +261,7 @@ for i in range(1, l):
     Dloc.fill_(-1)
     Lidx.fill_(-1)
     Ldst.fill_(torch.finfo(torch.float64).max)
+    #tL.append(time.time())
 
 pk.fence()
 
