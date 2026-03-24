@@ -54,24 +54,26 @@ def compute_norm(i, X, Xn, d):
     index by how many 
 """
 @pk.workunit
-def compute_dist_dblk(lin, X, Xn, Dloc, d, b, blknum, blksize):
-    # lin \in [0, blksize(blksize - 1)]
-    # index arithmetic to ensure lin \mapsto (off0, off1) is a bijection between {0, ..,  blksize(blksize-1)} and the upper right coordinates of a blksize matrix
-    off0: pk.int32 = lin // blksize
-    off1: pk.int32 = lin % blksize
-    # remap coordinates to top right triangle
-    # if off1-off0 >= blksize - 1:
-    flip0: pk.int32 = off0 + off1 >= blksize-1
-    off0 = (blksize - 1 - off0) * flip0 + off0 * (1 - flip0)
-    off1 = off1 * flip0 + (blksize - 1 - off1) * (1 - flip0)
+def compute_dist_dblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blknum, blksize):
+    # One team per j column within the diagonal block.
+    # X[j][t] is loop-invariant for the team — held in thread t's register.
+    jm: pk.int32 = team_member.league_rank()
+    j: pk.int32 = jm + b * blknum
 
-    i: pk.int32 = off0 + b * blknum
-    j: pk.int32 = off1 + b * blknum # j may be bigger than b, mod by b when storing in Dloc
-    dot: pk.float64 = 0.0
-    for t in range(d):
-        dot += X[i][t] * X[j][t]
-    Dloc[i][j%b] = -2.0 * dot + Xn[i] + Xn[j]
-    
+    im: pk.int32 = 0
+    for im in range(jm):           # strictly upper triangle: im < jm
+        i: pk.int32 = im + b * blknum
+
+        def dot_product(t: int, acc: pk.Acc[pk.double]):
+            acc += X[i][t] * X[j][t]
+
+        dot: pk.float64 = pk.parallel_reduce(pk.TeamThreadRange(team_member, d), dot_product)
+
+        if team_member.team_rank() == 0:
+            Dloc[i][jm] = -2.0 * dot + Xn[i] + Xn[j]
+
+        team_member.team_barrier()
+
 
 @pk.workunit
 def compute_dist_hblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blksize, blknum):
@@ -209,77 +211,66 @@ def build_G(i, Gidx, G, k):
             G[i][j] = 1
 
 
-# -----------------------------
-# run
-# -----------------------------
-t0 = time.time()
+def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
+    l = math.ceil(m / b)
 
-pk.parallel_for(m, compute_norm, X=X, Xn=Xn, d=d)
-pk.fence()
-
-# diag blocks compute distances
-for i in range(l):
-    # dispatch [compute, update Global]
-    blksize = min((i+1) * b, m) - i * b
-    pk.parallel_for(blksize * (blksize) , compute_dist_dblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b, blknum=i, blksize=blksize)
-
-pk.fence()
-
-# diag blocks update kNN
-pk.parallel_for(m, topk_row_dblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, m=m, k=k, b=b)
-pk.fence()
-
-# Global merge
-pk.parallel_for(m, merge_topk, Gdst=Gdst, Gidx=Gidx, Ldst=Ldst, Lidx=Lidx, k=k, offset=0)
-pk.fence()
-
-# flush locals
-Dloc.fill_(-1)
-Lidx.fill_(-1)
-Ldst.fill_(torch.finfo(torch.float64).max)
-pk.fence()
-
-
-#tD = time.time()
-#tL = []
-
-for i in range(1, l):
-    blksize = m - b * i
-    pk.parallel_for(pk.TeamPolicy(blksize, pk.AUTO), compute_dist_hblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b, blksize=blksize, blknum=i)
+    pk.parallel_for(m, compute_norm, X=X, Xn=Xn, d=d)
     pk.fence()
 
-    # compute local kNN
-    pk.parallel_for(b, topk_row_hblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b, blksize=blksize, blknum=i)
-    pk.parallel_for(blksize, topk_col_hblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b, blknum=i)
+    # diag blocks compute distances
+    for i in range(l):
+        blksize = min((i+1) * b, m) - i * b
+        pk.parallel_for(pk.TeamPolicy(blksize, pk.AUTO), compute_dist_dblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b, blknum=i, blksize=blksize)
+
     pk.fence()
 
-    # Merge local kNN with global kNN
-    pk.parallel_for(m - b * (i-1), merge_topk, Gdst=Gdst, Gidx=Gidx, Ldst=Ldst, Lidx=Lidx, k=k, offset=(b*(i-1)))
+    # diag blocks update kNN
+    pk.parallel_for(m, topk_row_dblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, m=m, k=k, b=b)
+    pk.fence()
+
+    # Global merge
+    pk.parallel_for(m, merge_topk, Gdst=Gdst, Gidx=Gidx, Ldst=Ldst, Lidx=Lidx, k=k, offset=0)
     pk.fence()
 
     # flush locals
     Dloc.fill_(-1)
     Lidx.fill_(-1)
     Ldst.fill_(torch.finfo(torch.float64).max)
-    #tL.append(time.time())
+    pk.fence()
 
-pk.fence()
+    for i in range(1, l):
+        blksize = m - b * i
+        pk.parallel_for(pk.TeamPolicy(blksize, pk.AUTO), compute_dist_hblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b, blksize=blksize, blknum=i)
+        pk.fence()
 
-t1 = time.time()
+        # compute local kNN
+        pk.parallel_for(b, topk_row_hblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b, blksize=blksize, blknum=i)
+        pk.parallel_for(blksize, topk_col_hblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b, blknum=i)
+        pk.fence()
 
-# pk.parallel_for(m, build_G, Gidx=Gidx, G=G, k=k)
-# pk.fence()
+        # Merge local kNN with global kNN
+        pk.parallel_for(m - b * (i-1), merge_topk, Gdst=Gdst, Gidx=Gidx, Ldst=Ldst, Lidx=Lidx, k=k, offset=(b*(i-1)))
+        pk.fence()
+
+        # flush locals
+        Dloc.fill_(-1)
+        Lidx.fill_(-1)
+        Ldst.fill_(torch.finfo(torch.float64).max)
+
+    pk.fence()
 
 
 # -----------------------------
-# copy back for display
+# run
 # -----------------------------
-# G_host = G.cpu().numpy()
+if __name__ == '__main__':
+    t0 = time.time()
 
-print("Coordinate matrix")
-print(X_np)
+    run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
 
-# print("\nkNN Graph")
-# print(G_host)
+    t1 = time.time()
 
-print("\nExecution time:", (t1 - t0) * 1000, "ms")
+    print("Coordinate matrix")
+    print(X_np)
+
+    print("\nExecution time:", (t1 - t0) * 1000, "ms")
