@@ -10,7 +10,7 @@ import math
 m = 12_000
 d = 70
 k = 2
-b = 32
+b = 32 # potentially this should be the block size in cuda i.e. 1024
 l = math.ceil(m / b)
 device = "cpu"          # ← change to "cuda" for GPU
 
@@ -21,20 +21,20 @@ device = "cpu"          # ← change to "cuda" for GPU
 np.random.seed(0)
 X_np = np.random.randint(0, 8, size=(m, d)).astype(np.float64)
 
-X         = torch.from_numpy(X_np.copy()).to(device)
-Xn        = torch.empty(m, dtype=torch.float64, device=device)
-Dloc      = torch.zeros((m, b), dtype=torch.float64, device=device)
+X         = torch.from_numpy(X_np.copy())
+Xn        = torch.empty(m, dtype=torch.float64)
+Dloc      = torch.zeros((m, b), dtype=torch.float64)
 
 # Global best indices and distances
-Gidx      = torch.full((m, k + 1), -1, dtype=torch.int32, device=device)
-Gdst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64, device=device)
+Gidx      = torch.full((m, k + 1), -1, dtype=torch.int32)
+Gdst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
 # local best indices and distances
-idx       = torch.full((m, k + 1), -1, dtype=torch.int32, device=device)
-best_dist = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64, device=device)
+idx       = torch.full((m, k + 1), -1, dtype=torch.int32)
+best_dist = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
-Lidx      = torch.full((m, k + 1), -1, dtype=torch.int32, device=device)
-Ldst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64, device=device)
+Lidx      = torch.full((m, k + 1), -1, dtype=torch.int32)
+Ldst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
 # G         = torch.zeros((m, m), dtype=torch.int32, device=device)
 
@@ -212,6 +212,15 @@ def build_G(i, Gidx, G, k):
 
 
 def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
+    if device == "cuda":
+        X      = X.cuda()
+        Xn     = Xn.cuda()
+        Dloc   = Dloc.cuda()
+        Gdst   = Gdst.cuda()
+        Gidx   = Gidx.cuda()
+        Ldst   = Ldst.cuda()
+        Lidx   = Lidx.cuda()
+
     l = math.ceil(m / b)
 
     pk.parallel_for(m, compute_norm, X=X, Xn=Xn, d=d)
