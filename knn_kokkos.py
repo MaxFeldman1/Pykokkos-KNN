@@ -10,10 +10,10 @@ import math
 device = "cpu"          # ← change to "cuda" for GPU
 
 if __name__ == '__main__':
-    m = 100 # 12_000
+    m = 100
     d = 70
     k = 2
-    b = 32 # potentially this should be the block size in cuda i.e. 1024
+    b = 32
 
     # -----------------------------
     # data
@@ -21,204 +21,215 @@ if __name__ == '__main__':
     np.random.seed(0)
     X_np = np.random.randint(0, 8, size=(m, d)).astype(np.float64)
 
-    X         = torch.from_numpy(X_np.copy())
-    Xn        = torch.empty(m, dtype=torch.float64)
-    Dloc      = torch.zeros((m, b), dtype=torch.float64)
+    X    = torch.from_numpy(X_np.copy())
+    Xn   = torch.empty(m, dtype=torch.float64)
+    Dloc = torch.zeros((m, b), dtype=torch.float64)
 
-    # Global best indices and distances
-    Gidx      = torch.full((m, k + 1), -1, dtype=torch.int32)
-    Gdst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Gidx = torch.full((m, k + 1), -1,                             dtype=torch.int32)
+    Gdst = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Lidx = torch.full((m, k + 1), -1,                             dtype=torch.int32)
+    Ldst = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
-    # local best indices and distances
-    idx       = torch.full((m, k + 1), -1, dtype=torch.int32)
-    best_dist = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
-
-    Lidx      = torch.full((m, k + 1), -1, dtype=torch.int32)
-    Ldst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
-
-    # G         = torch.zeros((m, m), dtype=torch.int32, device=device)
 
 # -----------------------------
-# kernels
+# fused pipeline kernel
+# One team = one dataset. team_barrier() replaces pk.fence() between phases.
+# Launch with TeamPolicy(N_datasets, AUTO) to process N datasets in parallel.
 # -----------------------------
 @pk.workunit
-def compute_norm(i, X, Xn, d):
-    s: pk.float64 = 0.0
-    for j in range(d):
-        s += X[i][j] * X[i][j]
-    Xn[i] = s
+def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx, m, d, k, b):
+    INF: pk.float64 = 1.7976931348623157e+308
 
+    # ---- Phase 1: norms ----
+    def norm_body(i: int):
+        s: pk.float64 = 0.0
+        t: pk.int32 = 0
+        for t in range(d):
+            s += X[i][t] * X[i][t]
+        Xn[i] = s
 
-"""
-    only need to compute the upper right triangle due to symmetry and zeros on diagonal
-    index by how many 
-"""
-@pk.workunit
-def compute_dist_dblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blknum, blksize):
-    # One team per j column within the diagonal block.
-    # X[j][t] is loop-invariant for the team — held in thread t's register.
-    jm: pk.int32 = team_member.league_rank()
-    j: pk.int32 = jm + b * blknum
+    pk.parallel_for(pk.TeamThreadRange(team_member, m), norm_body)
+    team_member.team_barrier()
 
-    im: pk.int32 = 0
-    for im in range(jm):           # strictly upper triangle: im < jm
-        i: pk.int32 = im + b * blknum
+    l: pk.int32 = (m + b - 1) // b
 
-        def dot_product(t: int, acc: pk.Acc[pk.double]):
-            acc += X[i][t] * X[j][t]
+    # ---- Phase 2: diagonal blocks — one thread per upper-triangle pair ----
+    blknum: pk.int32 = 0
+    for blknum in range(l):
+        # blksize = min((blknum+1)*b, m) - blknum*b
+        end: pk.int32 = (blknum + 1) * b
+        m_flag: pk.int32 = end > m
+        blksize: pk.int32 = end - m_flag * (end - m) - blknum * b
+        n_pairs: pk.int32 = blksize * (blksize - 1) // 2
 
-        dot: pk.float64 = pk.parallel_reduce(pk.TeamThreadRange(team_member, d), dot_product)
-
-        if team_member.team_rank() == 0:
+        def dblk_body(lin: int):
+            # decode linear index → strictly upper-triangle (im < jm)
+            # iterative: find largest jm s.t. jm*(jm-1)//2 <= lin
+            jm: pk.int32 = 1
+            start: pk.int32 = 0
+            while start + jm <= lin:
+                start += jm
+                jm += 1
+            im: pk.int32 = lin - start
+            i: pk.int32 = im + b * blknum
+            j: pk.int32 = jm + b * blknum
+            dot: pk.float64 = 0.0
+            t: pk.int32 = 0
+            for t in range(d):
+                dot += X[i][t] * X[j][t]
             Dloc[i][jm] = -2.0 * dot + Xn[i] + Xn[j]
 
+        pk.parallel_for(pk.TeamThreadRange(team_member, n_pairs), dblk_body)
         team_member.team_barrier()
 
-
-@pk.workunit
-def compute_dist_and_topk_col_hblk(team_member: pk.TeamMember, X, Xn, Dloc, Lidx, Ldst, d, b, blksize, blknum, k):
-    # One team per j column. X[j][:] is fixed for the team's lifetime —
-    # X[j][t] held in a thread register, reused across all b i-iterations.
-    jm: pk.int32 = team_member.league_rank()
-    j: pk.int32 = jm + b * blknum
-
-    im: pk.int32 = 0
-    for im in range(b):
-        i: pk.int32 = im + b * (blknum - 1)
-
-        # d threads split the t-axis. All threads access X[i][0..d-1]
-        # and X[j][0..d-1] simultaneously — coalesced row reads.
-        def dot_product(t: int, acc: pk.Acc[pk.double]):
-            acc += X[i][t] * X[j][t]
-
-        dot: pk.float64 = pk.parallel_reduce(pk.TeamThreadRange(team_member, d), dot_product)
-
-        if team_member.team_rank() == 0:
-            Dloc[jm][im] = -2.0 * dot + Xn[i] + Xn[j]
-
-        team_member.team_barrier()
-
-    # topk_col_hblk fused here: team owns Dloc[jm][:] entirely,
-    # no cross-team data needed, no extra fence required.
-    if team_member.team_rank() == 0:
-        im = 0
-        for im in range(b):
-            i: pk.int32 = im + b * (blknum - 1)
-            val: pk.float64 = Dloc[jm][im]
-
+    # ---- Phase 3: topk within each diagonal block ----
+    def topk_dblk_body(i: int):
+        im: pk.int32 = i % b
+        id_: pk.int32 = i - im
+        m_top: pk.int32 = m < id_ + b
+        top_range: pk.int32 = m * m_top + (id_ + b) * (1 - m_top)
+        j: pk.int32 = 0
+        for j in range(id_, top_range):
+            jm: pk.int32 = j % b
+            i_first: pk.int32 = im <= jm
+            idx0: pk.int32 = i * i_first + j * (1 - i_first)
+            idx1: pk.int32 = jm * i_first + im * (1 - i_first)
+            val: pk.float64 = Dloc[idx0][idx1]
             worst: pk.int32 = 0
             t: pk.int32 = 0
-            prop: pk.int32 = 0
             for t in range(1, k + 1):
-                prop = int(Ldst[j][t] > Ldst[j][worst])
-                worst = t * prop + worst * (1 - prop)
+                if Ldst[i][t] > Ldst[i][worst]:
+                    worst = t
+            if val < Ldst[i][worst]:
+                Ldst[i][worst] = val
+                Lidx[i][worst] = j
 
-            prop = int(val < Ldst[j][worst])
-            Ldst[j][worst] = val * prop + Ldst[j][worst] * (1 - prop)
-            Lidx[j][worst] = i * prop + Lidx[j][worst] * (1 - prop)
+    pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
+    team_member.team_barrier()
 
-@pk.workunit
-def merge_topk(i, Gdst, Gidx, Ldst, Lidx, k, offset):
-    i = i+offset
-    j: pk.int32 = 0
-    for j in range(k+1):
-        dst: pk.float64 = Ldst[i][j]
-        idx: pk.int32 = Lidx[i][j]
+    # ---- Phase 4: merge diagonal locals into global ----
+    def merge_diag_body(i: int):
+        s: pk.int32 = 0
+        for s in range(k + 1):
+            dst: pk.float64 = Ldst[i][s]
+            idx: pk.int32 = Lidx[i][s]
+            worst: pk.int32 = 0
+            t: pk.int32 = 0
+            for t in range(1, k + 1):
+                if Gdst[i][t] > Gdst[i][worst]:
+                    worst = t
+            if dst < Gdst[i][worst]:
+                Gdst[i][worst] = dst
+                Gidx[i][worst] = idx
 
-        worst: pk.int32 = 0
-        t: pk.int32 = 0
-        for t in range(1, k + 1):
-            if Gdst[i][t] > Gdst[i][worst]:
-                worst = t
+    pk.parallel_for(pk.TeamThreadRange(team_member, m), merge_diag_body)
+    team_member.team_barrier()
 
-        if dst < Gdst[i][worst]:
-            Gdst[i][worst] = dst
-            Gidx[i][worst] = idx
+    # ---- flush Ldst / Lidx / Dloc ----
+    def flush_local(lin: int):
+        row: pk.int32 = lin // (k + 1)
+        col: pk.int32 = lin % (k + 1)
+        Ldst[row][col] = INF
+        Lidx[row][col] = -1
 
+    def flush_dloc(lin: int):
+        row: pk.int32 = lin // bfence
+        col: pk.int32 = lin % b
+        Dloc[row][col] = -1.0
 
-@pk.workunit
-def topk_row(i, D, idx, m, k, best_dist):
-    j: pk.int32 = 0
-    for j in range(m):
-        val: pk.float64 = D[i][j]
+    pk.parallel_for(pk.TeamThreadRange(team_member, m * (k + 1)), flush_local)
+    pk.parallel_for(pk.TeamThreadRange(team_member, m * b),       flush_dloc)
+    team_member.team_barrier()
 
-        worst: pk.int32 = 0
-        t: pk.int32 = 0
-        for t in range(1, k + 1):
-            if best_dist[i][t] > best_dist[i][worst]:
-                worst = t
+    # ---- Phase 5-7: off-diagonal (hblk) loop ----
+    hblk_i: pk.int32 = 0
+    for hblk_i in range(1, l):
+        blksize_h: pk.int32 = m - b * hblk_i
 
-        if val < best_dist[i][worst]:
-            best_dist[i][worst] = val
-            idx[i][worst] = j
+        # Compute distances + topk_col fused — one thread owns one j column entirely
+        def hblk_col_body(jm: int):
+            j: pk.int32 = jm + b * hblk_i
+            im_h: pk.int32 = 0
+            for im_h in range(b):
+                i_h: pk.int32 = im_h + b * (hblk_i - 1)
+                dot: pk.float64 = 0.0
+                t: pk.int32 = 0
+                for t in range(d):
+                    dot += X[i_h][t] * X[j][t]
+                val: pk.float64 = -2.0 * dot + Xn[i_h] + Xn[j]
+                Dloc[jm][im_h] = val
+                # inline topk_col update for Ldst[j]
+                worst: pk.int32 = 0
+                t2: pk.int32 = 0
+                prop: pk.int32 = 0
+                for t2 in range(1, k + 1):
+                    prop = Ldst[j][t2] > Ldst[j][worst]
+                    worst = t2 * prop + worst * (1 - prop)
+                prop = val < Ldst[j][worst]
+                Ldst[j][worst] = val * prop + Ldst[j][worst] * (1 - prop)
+                Lidx[j][worst] = i_h * prop + Lidx[j][worst] * (1 - prop)
 
+        pk.parallel_for(pk.TeamThreadRange(team_member, blksize_h), hblk_col_body)
+        team_member.team_barrier()
 
-@pk.workunit
-def topk_row_dblk(i, Dloc, Lidx, Ldst, m, k, b):
-    im: pk.int32 = i % b
-    id: pk.int32 = i - im
-    j: pk.int32 = 0
+        # topk_row — one thread per i-row, reads across all j columns
+        def topk_row_body(im_r: int):
+            i_r: pk.int32 = im_r + b * (hblk_i - 1)
+            jm_r: pk.int32 = 0
+            for jm_r in range(blksize_h):
+                j_r: pk.int32 = jm_r + b * hblk_i
+                val_r: pk.float64 = Dloc[jm_r][im_r]
+                worst_r: pk.int32 = 0
+                t_r: pk.int32 = 0
+                prop_r: pk.int32 = 0
+                for t_r in range(1, k + 1):
+                    prop_r = Ldst[i_r][t_r] > Ldst[i_r][worst_r]
+                    worst_r = t_r * prop_r + worst_r * (1 - prop_r)
+                prop_r = val_r < Ldst[i_r][worst_r]
+                Ldst[i_r][worst_r] = val_r * prop_r + Ldst[i_r][worst_r] * (1 - prop_r)
+                Lidx[i_r][worst_r] = j_r * prop_r + Lidx[i_r][worst_r] * (1 - prop_r)
 
-    m_top_of_range: pk.int32 = m < id + b
-    top_of_range: pk.int32 = (m * m_top_of_range) + ((id + b) * (1 - m_top_of_range))
+        pk.parallel_for(pk.TeamThreadRange(team_member, b), topk_row_body)
+        team_member.team_barrier()
 
-    for j in range(id, top_of_range):
-        jm: pk.int32 = j % b
+        # merge hblk locals into global
+        merge_count: pk.int32 = m - b * (hblk_i - 1)
+        merge_off: pk.int32 = b * (hblk_i - 1)
 
-        i_first: pk.int32 = im <= jm
-        _idx0: pk.int32 = (i * i_first) + (j * (1 - i_first))
-        _idx1: pk.int32 = (jm * i_first) + (im * (1 - i_first))
-        val: pk.float64 = Dloc[_idx0][_idx1]
+        def merge_hblk_body(lin_m: int):
+            i_m: pk.int32 = lin_m + merge_off
+            s_m: pk.int32 = 0
+            for s_m in range(k + 1):
+                dst_m: pk.float64 = Ldst[i_m][s_m]
+                idx_m: pk.int32 = Lidx[i_m][s_m]
+                worst_m: pk.int32 = 0
+                t_m: pk.int32 = 0
+                for t_m in range(1, k + 1):
+                    if Gdst[i_m][t_m] > Gdst[i_m][worst_m]:
+                        worst_m = t_m
+                if dst_m < Gdst[i_m][worst_m]:
+                    Gdst[i_m][worst_m] = dst_m
+                    Gidx[i_m][worst_m] = idx_m
 
-        worst: pk.int32 = 0
-        t: pk.int32 = 0
-        for t in range(1, k + 1):
-            if Ldst[i][t] > Ldst[i][worst]:
-                worst = t
+        pk.parallel_for(pk.TeamThreadRange(team_member, merge_count), merge_hblk_body)
+        team_member.team_barrier()
 
-        if val < Ldst[i][worst]:
-            Ldst[i][worst] = val
-            Lidx[i][worst] = j
+        # flush for next iteration
+        def flush_local_h(lin: int):
+            row: pk.int32 = lin // (k + 1)
+            col: pk.int32 = lin % (k + 1)
+            Ldst[row][col] = INF
+            Lidx[row][col] = -1
 
+        def flush_dloc_h(lin: int):
+            row: pk.int32 = lin // b
+            col: pk.int32 = lin % b
+            Dloc[row][col] = -1.0
 
-@pk.workunit
-def topk_row_hblk(im, Dloc, Lidx, Ldst, k, b, blksize, blknum):
-    i: pk.int32 = im + b * (blknum-1)
-    jm: pk.int32 = 0
-    for jm in range(blksize):
-        j: pk.int32 = jm + b * blknum
-        val: pk.float64 = Dloc[jm][im]
-        worst: pk.int32 = 0
-        t: pk.int32 = 0
-        prop: pk.int32 = 0
-        for t in range(1, k + 1):
-            prop = int(Ldst[i][t] > Ldst[i][worst])
-            worst = t * prop + worst * (1 - prop)
-
-        prop = int(val < Ldst[i][worst])
-        Ldst[i][worst] = val * prop + Ldst[i][worst] * (1 - prop)
-        Lidx[i][worst] = j * prop + Lidx[i][worst] * (1 - prop)
-
-
-@pk.workunit
-def topk_col_hblk(jm, Dloc, Lidx, Ldst, k, b, blknum):
-    j: pk.int32 = jm + b * blknum
-    i: pk.int32 = 0
-    for i in range(b * (blknum-1), b * blknum):
-        im: pk.int32 = i - b * (blknum-1)
-        val: pk.float64 = Dloc[jm][im]
-
-        worst: pk.int32 = 0
-        t: pk.int32 = 0
-        prop: pk.int32 = 0
-        for t in range(1, k + 1):
-            prop =  int(Ldst[j][t] > Ldst[j][worst])
-            worst = t * prop + worst * (1 - prop)
-        
-        prop = int(val < Ldst[j][worst])
-        Ldst[j][worst] = val * prop + Ldst[j][worst] * (1 - prop)
-        Lidx[j][worst] = i * prop + Lidx[j][worst] * (1 - prop)
-
+        if hblk_i < l-1:
+            pk.parallel_for(pk.TeamThreadRange(team_member, m * (k + 1)), flush_local_h)
+            pk.parallel_for(pk.TeamThreadRange(team_member, m * b),       flush_dloc_h)
+            team_member.team_barrier()
 
 
 @pk.workunit
@@ -232,58 +243,21 @@ def build_G(i, Gidx, G, k):
 
 def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     if device == "cuda":
-        X      = X.cuda()
-        Xn     = Xn.cuda()
-        Dloc   = Dloc.cuda()
-        Gdst   = Gdst.cuda()
-        Gidx   = Gidx.cuda()
-        Ldst   = Ldst.cuda()
-        Lidx   = Lidx.cuda()
+        X    = X.cuda()
+        Xn   = Xn.cuda()
+        Dloc = Dloc.cuda()
+        Gdst = Gdst.cuda()
+        Gidx = Gidx.cuda()
+        Ldst = Ldst.cuda()
+        Lidx = Lidx.cuda()
 
-    l = math.ceil(m / b)
-
-    pk.parallel_for(m, compute_norm, X=X, Xn=Xn, d=d)
-    pk.fence()
-
-    # diag blocks compute distances
-    for i in range(l):
-        blksize = min((i+1) * b, m) - i * b
-        pk.parallel_for(pk.TeamPolicy(blksize, pk.AUTO), compute_dist_dblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b, blknum=i, blksize=blksize)
-
-    pk.fence()
-
-    # diag blocks update kNN
-    pk.parallel_for(m, topk_row_dblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, m=m, k=k, b=b)
-    pk.fence()
-
-    # Global merge
-    pk.parallel_for(m, merge_topk, Gdst=Gdst, Gidx=Gidx, Ldst=Ldst, Lidx=Lidx, k=k, offset=0)
-    pk.fence()
-
-    # flush locals
-    Dloc.fill_(-1)
-    Lidx.fill_(-1)
-    Ldst.fill_(torch.finfo(torch.float64).max)
-    pk.fence()
-
-    for i in range(1, l):
-        blksize = m - b * i
-        pk.parallel_for(pk.TeamPolicy(blksize, pk.AUTO), compute_dist_and_topk_col_hblk, X=X, Xn=Xn, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, d=d, b=b, blksize=blksize, blknum=i, k=k)
-        pk.fence()
-
-        # compute local kNN (row pass still requires full Dloc, cannot be fused)
-        pk.parallel_for(b, topk_row_hblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b, blksize=blksize, blknum=i)
-        pk.fence()
-
-        # Merge local kNN with global kNN
-        pk.parallel_for(m - b * (i-1), merge_topk, Gdst=Gdst, Gidx=Gidx, Ldst=Ldst, Lidx=Lidx, k=k, offset=(b*(i-1)))
-        pk.fence()
-
-        # flush locals
-        Dloc.fill_(-1)
-        Lidx.fill_(-1)
-        Ldst.fill_(torch.finfo(torch.float64).max)
-
+    # One team per dataset. Swap 1 → N to process N datasets simultaneously.
+    pk.parallel_for(
+        pk.TeamPolicy(1, pk.AUTO),
+        knn_pipeline_kernel,
+        X=X, Xn=Xn, Dloc=Dloc, Gdst=Gdst, Gidx=Gidx,
+        Ldst=Ldst, Lidx=Lidx, m=m, d=d, k=k, b=b
+    )
     pk.fence()
 
 

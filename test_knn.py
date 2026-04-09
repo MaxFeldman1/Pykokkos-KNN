@@ -4,7 +4,7 @@ import torch
 # -----------------------------
 # parameters
 # -----------------------------
-m = 96   # 3 blocks of b=32 — exercises both diagonal and hblk paths
+m = 100  # 3 blocks of b=32, 1 block of 4 — exercises both diagonal and hblk paths
 d = 8
 k = 2
 b = 32
