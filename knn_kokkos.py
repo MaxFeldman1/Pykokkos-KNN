@@ -7,36 +7,36 @@ import math
 # -----------------------------
 # parameters
 # -----------------------------
-m = 12_000
-d = 70
-k = 2
-b = 32 # potentially this should be the block size in cuda i.e. 1024
-l = math.ceil(m / b)
 device = "cpu"          # ← change to "cuda" for GPU
 
+if __name__ == '__main__':
+    m = 100 # 12_000
+    d = 70
+    k = 2
+    b = 32 # potentially this should be the block size in cuda i.e. 1024
 
-# -----------------------------
-# data
-# -----------------------------
-np.random.seed(0)
-X_np = np.random.randint(0, 8, size=(m, d)).astype(np.float64)
+    # -----------------------------
+    # data
+    # -----------------------------
+    np.random.seed(0)
+    X_np = np.random.randint(0, 8, size=(m, d)).astype(np.float64)
 
-X         = torch.from_numpy(X_np.copy())
-Xn        = torch.empty(m, dtype=torch.float64)
-Dloc      = torch.zeros((m, b), dtype=torch.float64)
+    X         = torch.from_numpy(X_np.copy())
+    Xn        = torch.empty(m, dtype=torch.float64)
+    Dloc      = torch.zeros((m, b), dtype=torch.float64)
 
-# Global best indices and distances
-Gidx      = torch.full((m, k + 1), -1, dtype=torch.int32)
-Gdst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    # Global best indices and distances
+    Gidx      = torch.full((m, k + 1), -1, dtype=torch.int32)
+    Gdst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
-# local best indices and distances
-idx       = torch.full((m, k + 1), -1, dtype=torch.int32)
-best_dist = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    # local best indices and distances
+    idx       = torch.full((m, k + 1), -1, dtype=torch.int32)
+    best_dist = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
-Lidx      = torch.full((m, k + 1), -1, dtype=torch.int32)
-Ldst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Lidx      = torch.full((m, k + 1), -1, dtype=torch.int32)
+    Ldst      = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
-# G         = torch.zeros((m, m), dtype=torch.int32, device=device)
+    # G         = torch.zeros((m, m), dtype=torch.int32, device=device)
 
 # -----------------------------
 # kernels
@@ -76,7 +76,7 @@ def compute_dist_dblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blknum, blk
 
 
 @pk.workunit
-def compute_dist_hblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blksize, blknum):
+def compute_dist_and_topk_col_hblk(team_member: pk.TeamMember, X, Xn, Dloc, Lidx, Ldst, d, b, blksize, blknum, k):
     # One team per j column. X[j][:] is fixed for the team's lifetime —
     # X[j][t] held in a thread register, reused across all b i-iterations.
     jm: pk.int32 = team_member.league_rank()
@@ -97,6 +97,25 @@ def compute_dist_hblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blksize, bl
             Dloc[jm][im] = -2.0 * dot + Xn[i] + Xn[j]
 
         team_member.team_barrier()
+
+    # topk_col_hblk fused here: team owns Dloc[jm][:] entirely,
+    # no cross-team data needed, no extra fence required.
+    if team_member.team_rank() == 0:
+        im = 0
+        for im in range(b):
+            i: pk.int32 = im + b * (blknum - 1)
+            val: pk.float64 = Dloc[jm][im]
+
+            worst: pk.int32 = 0
+            t: pk.int32 = 0
+            prop: pk.int32 = 0
+            for t in range(1, k + 1):
+                prop = int(Ldst[j][t] > Ldst[j][worst])
+                worst = t * prop + worst * (1 - prop)
+
+            prop = int(val < Ldst[j][worst])
+            Ldst[j][worst] = val * prop + Ldst[j][worst] * (1 - prop)
+            Lidx[j][worst] = i * prop + Lidx[j][worst] * (1 - prop)
 
 @pk.workunit
 def merge_topk(i, Gdst, Gidx, Ldst, Lidx, k, offset):
@@ -249,12 +268,11 @@ def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
 
     for i in range(1, l):
         blksize = m - b * i
-        pk.parallel_for(pk.TeamPolicy(blksize, pk.AUTO), compute_dist_hblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b, blksize=blksize, blknum=i)
+        pk.parallel_for(pk.TeamPolicy(blksize, pk.AUTO), compute_dist_and_topk_col_hblk, X=X, Xn=Xn, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, d=d, b=b, blksize=blksize, blknum=i, k=k)
         pk.fence()
 
-        # compute local kNN
+        # compute local kNN (row pass still requires full Dloc, cannot be fused)
         pk.parallel_for(b, topk_row_hblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b, blksize=blksize, blknum=i)
-        pk.parallel_for(blksize, topk_col_hblk, Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b, blknum=i)
         pk.fence()
 
         # Merge local kNN with global kNN
