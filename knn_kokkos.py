@@ -243,13 +243,16 @@ def build_G(i, Gidx, G, k):
 
 def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     if device == "cuda":
-        X    = X.cuda()
-        Xn   = Xn.cuda()
-        Dloc = Dloc.cuda()
-        Gdst = Gdst.cuda()
-        Gidx = Gidx.cuda()
-        Ldst = Ldst.cuda()
-        Lidx = Lidx.cuda()
+        import cupy as cp
+        # print("TODO: convert tensors to cupy")
+        X      = cp.asarray(X)
+        Xn     = cp.asarray(Xn)
+        Dloc   = cp.asarray(Dloc)
+        Gdst   = cp.asarray(Gdst)
+        Gidx   = cp.asarray(Gidx)
+        Ldst   = cp.asarray(Ldst)
+        Lidx   = cp.asarray(Lidx)
+
 
     # One team per dataset. Swap 1 → N to process N datasets simultaneously.
     pk.parallel_for(
