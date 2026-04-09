@@ -133,7 +133,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
         Lidx[row][col] = -1
 
     def flush_dloc(lin: int):
-        row: pk.int32 = lin // bfence
+        row: pk.int32 = lin // b
         col: pk.int32 = lin % b
         Dloc[row][col] = -1.0
 
