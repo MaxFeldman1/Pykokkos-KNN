@@ -249,16 +249,6 @@ def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     Ldst    : (N, m, k+1)
     Lidx    : (N, m, k+1)
     """
-    if device == "cuda":
-        import cupy as cp
-        X    = cp.asarray(X)
-        Xn   = cp.asarray(Xn)
-        Dloc = cp.asarray(Dloc)
-        Gdst = cp.asarray(Gdst)
-        Gidx = cp.asarray(Gidx)
-        Ldst = cp.asarray(Ldst)
-        Lidx = cp.asarray(Lidx)
-
     # One team per dataset — N teams run in parallel across SMs.
     pk.parallel_for(
         pk.TeamPolicy(N, pk.AUTO),
@@ -273,6 +263,17 @@ def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
 # run
 # -----------------------------
 if __name__ == '__main__':
+    
+    if device == "cuda":
+        import cupy as cp
+        X    = cp.asarray(X)
+        Xn   = cp.asarray(Xn)
+        Dloc = cp.asarray(Dloc)
+        Gdst = cp.asarray(Gdst)
+        Gidx = cp.asarray(Gidx)
+        Ldst = cp.asarray(Ldst)
+        Lidx = cp.asarray(Lidx)
+
     t0 = time.time()
 
     run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
