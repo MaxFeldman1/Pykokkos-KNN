@@ -10,25 +10,26 @@ import math
 device = "cpu"          # ← change to "cuda" for GPU
 
 if __name__ == '__main__':
+    N = 2       # batch size — number of datasets to process simultaneously
     m = 100
     d = 70
     k = 2
     b = 32
 
     # -----------------------------
-    # data
+    # data  — leading N dimension
     # -----------------------------
     np.random.seed(0)
-    X_np = np.random.randint(0, 8, size=(m, d)).astype(np.float64)
+    X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float64)
 
     X    = torch.from_numpy(X_np.copy())
-    Xn   = torch.empty(m, dtype=torch.float64)
-    Dloc = torch.zeros((m, b), dtype=torch.float64)
+    Xn   = torch.empty((N, m), dtype=torch.float64)
+    Dloc = torch.zeros((N, m, b), dtype=torch.float64)
 
-    Gidx = torch.full((m, k + 1), -1,                             dtype=torch.int32)
-    Gdst = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
-    Lidx = torch.full((m, k + 1), -1,                             dtype=torch.int32)
-    Ldst = torch.full((m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
+    Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
+    Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
 
 # -----------------------------
@@ -39,14 +40,16 @@ if __name__ == '__main__':
 @pk.workunit
 def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx, m, d, k, b):
     INF: pk.float64 = 1.7976931348623157e+308
+    # Each team processes one dataset. n selects the batch slice.
+    n: pk.int32 = team_member.league_rank()
 
     # ---- Phase 1: norms ----
     def norm_body(i: int):
         s: pk.float64 = 0.0
         t: pk.int32 = 0
         for t in range(d):
-            s += X[i][t] * X[i][t]
-        Xn[i] = s
+            s += X[n][i][t] * X[n][i][t]
+        Xn[n][i] = s
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), norm_body)
     team_member.team_barrier()
@@ -56,15 +59,12 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
     # ---- Phase 2: diagonal blocks — one thread per upper-triangle pair ----
     blknum: pk.int32 = 0
     for blknum in range(l):
-        # blksize = min((blknum+1)*b, m) - blknum*b
         end: pk.int32 = (blknum + 1) * b
         m_flag: pk.int32 = end > m
         blksize: pk.int32 = end - m_flag * (end - m) - blknum * b
         n_pairs: pk.int32 = blksize * (blksize - 1) // 2
 
         def dblk_body(lin: int):
-            # decode linear index → strictly upper-triangle (im < jm)
-            # iterative: find largest jm s.t. jm*(jm-1)//2 <= lin
             jm: pk.int32 = 1
             start: pk.int32 = 0
             while start + jm <= lin:
@@ -76,8 +76,8 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
             dot: pk.float64 = 0.0
             t: pk.int32 = 0
             for t in range(d):
-                dot += X[i][t] * X[j][t]
-            Dloc[i][jm] = -2.0 * dot + Xn[i] + Xn[j]
+                dot += X[n][i][t] * X[n][j][t]
+            Dloc[n][i][jm] = -2.0 * dot + Xn[n][i] + Xn[n][j]
 
         pk.parallel_for(pk.TeamThreadRange(team_member, n_pairs), dblk_body)
         team_member.team_barrier()
@@ -94,15 +94,15 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
             i_first: pk.int32 = im <= jm
             idx0: pk.int32 = i * i_first + j * (1 - i_first)
             idx1: pk.int32 = jm * i_first + im * (1 - i_first)
-            val: pk.float64 = Dloc[idx0][idx1]
+            val: pk.float64 = Dloc[n][idx0][idx1]
             worst: pk.int32 = 0
             t: pk.int32 = 0
             for t in range(1, k + 1):
-                if Ldst[i][t] > Ldst[i][worst]:
+                if Ldst[n][i][t] > Ldst[n][i][worst]:
                     worst = t
-            if val < Ldst[i][worst]:
-                Ldst[i][worst] = val
-                Lidx[i][worst] = j
+            if val < Ldst[n][i][worst]:
+                Ldst[n][i][worst] = val
+                Lidx[n][i][worst] = j
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
     team_member.team_barrier()
@@ -111,16 +111,16 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
     def merge_diag_body(i: int):
         s: pk.int32 = 0
         for s in range(k + 1):
-            dst: pk.float64 = Ldst[i][s]
-            idx: pk.int32 = Lidx[i][s]
+            dst: pk.float64 = Ldst[n][i][s]
+            idx: pk.int32 = Lidx[n][i][s]
             worst: pk.int32 = 0
             t: pk.int32 = 0
             for t in range(1, k + 1):
-                if Gdst[i][t] > Gdst[i][worst]:
+                if Gdst[n][i][t] > Gdst[n][i][worst]:
                     worst = t
-            if dst < Gdst[i][worst]:
-                Gdst[i][worst] = dst
-                Gidx[i][worst] = idx
+            if dst < Gdst[n][i][worst]:
+                Gdst[n][i][worst] = dst
+                Gidx[n][i][worst] = idx
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), merge_diag_body)
     team_member.team_barrier()
@@ -129,13 +129,13 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
     def flush_local(lin: int):
         row: pk.int32 = lin // (k + 1)
         col: pk.int32 = lin % (k + 1)
-        Ldst[row][col] = INF
-        Lidx[row][col] = -1
+        Ldst[n][row][col] = INF
+        Lidx[n][row][col] = -1
 
     def flush_dloc(lin: int):
         row: pk.int32 = lin // b
         col: pk.int32 = lin % b
-        Dloc[row][col] = -1.0
+        Dloc[n][row][col] = -1.0
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m * (k + 1)), flush_local)
     pk.parallel_for(pk.TeamThreadRange(team_member, m * b),       flush_dloc)
@@ -146,7 +146,6 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
     for hblk_i in range(1, l):
         blksize_h: pk.int32 = m - b * hblk_i
 
-        # Compute distances + topk_col fused — one thread owns one j column entirely
         def hblk_col_body(jm: int):
             j: pk.int32 = jm + b * hblk_i
             im_h: pk.int32 = 0
@@ -155,44 +154,41 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
                 dot: pk.float64 = 0.0
                 t: pk.int32 = 0
                 for t in range(d):
-                    dot += X[i_h][t] * X[j][t]
-                val: pk.float64 = -2.0 * dot + Xn[i_h] + Xn[j]
-                Dloc[jm][im_h] = val
-                # inline topk_col update for Ldst[j]
+                    dot += X[n][i_h][t] * X[n][j][t]
+                val: pk.float64 = -2.0 * dot + Xn[n][i_h] + Xn[n][j]
+                Dloc[n][jm][im_h] = val
                 worst: pk.int32 = 0
                 t2: pk.int32 = 0
                 prop: pk.int32 = 0
                 for t2 in range(1, k + 1):
-                    prop = Ldst[j][t2] > Ldst[j][worst]
+                    prop = Ldst[n][j][t2] > Ldst[n][j][worst]
                     worst = t2 * prop + worst * (1 - prop)
-                prop = val < Ldst[j][worst]
-                Ldst[j][worst] = val * prop + Ldst[j][worst] * (1 - prop)
-                Lidx[j][worst] = i_h * prop + Lidx[j][worst] * (1 - prop)
+                prop = val < Ldst[n][j][worst]
+                Ldst[n][j][worst] = val * prop + Ldst[n][j][worst] * (1 - prop)
+                Lidx[n][j][worst] = i_h * prop + Lidx[n][j][worst] * (1 - prop)
 
         pk.parallel_for(pk.TeamThreadRange(team_member, blksize_h), hblk_col_body)
         team_member.team_barrier()
 
-        # topk_row — one thread per i-row, reads across all j columns
         def topk_row_body(im_r: int):
             i_r: pk.int32 = im_r + b * (hblk_i - 1)
             jm_r: pk.int32 = 0
             for jm_r in range(blksize_h):
                 j_r: pk.int32 = jm_r + b * hblk_i
-                val_r: pk.float64 = Dloc[jm_r][im_r]
+                val_r: pk.float64 = Dloc[n][jm_r][im_r]
                 worst_r: pk.int32 = 0
                 t_r: pk.int32 = 0
                 prop_r: pk.int32 = 0
                 for t_r in range(1, k + 1):
-                    prop_r = Ldst[i_r][t_r] > Ldst[i_r][worst_r]
+                    prop_r = Ldst[n][i_r][t_r] > Ldst[n][i_r][worst_r]
                     worst_r = t_r * prop_r + worst_r * (1 - prop_r)
-                prop_r = val_r < Ldst[i_r][worst_r]
-                Ldst[i_r][worst_r] = val_r * prop_r + Ldst[i_r][worst_r] * (1 - prop_r)
-                Lidx[i_r][worst_r] = j_r * prop_r + Lidx[i_r][worst_r] * (1 - prop_r)
+                prop_r = val_r < Ldst[n][i_r][worst_r]
+                Ldst[n][i_r][worst_r] = val_r * prop_r + Ldst[n][i_r][worst_r] * (1 - prop_r)
+                Lidx[n][i_r][worst_r] = j_r * prop_r + Lidx[n][i_r][worst_r] * (1 - prop_r)
 
         pk.parallel_for(pk.TeamThreadRange(team_member, b), topk_row_body)
         team_member.team_barrier()
 
-        # merge hblk locals into global
         merge_count: pk.int32 = m - b * (hblk_i - 1)
         merge_off: pk.int32 = b * (hblk_i - 1)
 
@@ -200,33 +196,32 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
             i_m: pk.int32 = lin_m + merge_off
             s_m: pk.int32 = 0
             for s_m in range(k + 1):
-                dst_m: pk.float64 = Ldst[i_m][s_m]
-                idx_m: pk.int32 = Lidx[i_m][s_m]
+                dst_m: pk.float64 = Ldst[n][i_m][s_m]
+                idx_m: pk.int32 = Lidx[n][i_m][s_m]
                 worst_m: pk.int32 = 0
                 t_m: pk.int32 = 0
                 for t_m in range(1, k + 1):
-                    if Gdst[i_m][t_m] > Gdst[i_m][worst_m]:
+                    if Gdst[n][i_m][t_m] > Gdst[n][i_m][worst_m]:
                         worst_m = t_m
-                if dst_m < Gdst[i_m][worst_m]:
-                    Gdst[i_m][worst_m] = dst_m
-                    Gidx[i_m][worst_m] = idx_m
+                if dst_m < Gdst[n][i_m][worst_m]:
+                    Gdst[n][i_m][worst_m] = dst_m
+                    Gidx[n][i_m][worst_m] = idx_m
 
         pk.parallel_for(pk.TeamThreadRange(team_member, merge_count), merge_hblk_body)
         team_member.team_barrier()
 
-        # flush for next iteration
         def flush_local_h(lin: int):
             row: pk.int32 = lin // (k + 1)
             col: pk.int32 = lin % (k + 1)
-            Ldst[row][col] = INF
-            Lidx[row][col] = -1
+            Ldst[n][row][col] = INF
+            Lidx[n][row][col] = -1
 
         def flush_dloc_h(lin: int):
             row: pk.int32 = lin // b
             col: pk.int32 = lin % b
-            Dloc[row][col] = -1.0
+            Dloc[n][row][col] = -1.0
 
-        if hblk_i < l-1:
+        if hblk_i < l - 1:
             pk.parallel_for(pk.TeamThreadRange(team_member, m * (k + 1)), flush_local_h)
             pk.parallel_for(pk.TeamThreadRange(team_member, m * b),       flush_dloc_h)
             team_member.team_barrier()
@@ -241,22 +236,30 @@ def build_G(i, Gidx, G, k):
             G[i][j] = 1
 
 
-def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
+def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
+    """
+    N       : number of datasets (batch size)
+    X       : (N, m, d)
+    Xn      : (N, m)
+    Dloc    : (N, m, b)
+    Gdst    : (N, m, k+1)
+    Gidx    : (N, m, k+1)
+    Ldst    : (N, m, k+1)
+    Lidx    : (N, m, k+1)
+    """
     if device == "cuda":
         import cupy as cp
-        # print("TODO: convert tensors to cupy")
-        X      = cp.asarray(X)
-        Xn     = cp.asarray(Xn)
-        Dloc   = cp.asarray(Dloc)
-        Gdst   = cp.asarray(Gdst)
-        Gidx   = cp.asarray(Gidx)
-        Ldst   = cp.asarray(Ldst)
-        Lidx   = cp.asarray(Lidx)
+        X    = cp.asarray(X)
+        Xn   = cp.asarray(Xn)
+        Dloc = cp.asarray(Dloc)
+        Gdst = cp.asarray(Gdst)
+        Gidx = cp.asarray(Gidx)
+        Ldst = cp.asarray(Ldst)
+        Lidx = cp.asarray(Lidx)
 
-
-    # One team per dataset. Swap 1 → N to process N datasets simultaneously.
+    # One team per dataset — N teams run in parallel across SMs.
     pk.parallel_for(
-        pk.TeamPolicy(1, pk.AUTO),
+        pk.TeamPolicy(N, pk.AUTO),
         knn_pipeline_kernel,
         X=X, Xn=Xn, Dloc=Dloc, Gdst=Gdst, Gidx=Gidx,
         Ldst=Ldst, Lidx=Lidx, m=m, d=d, k=k, b=b
@@ -270,11 +273,11 @@ def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
 if __name__ == '__main__':
     t0 = time.time()
 
-    run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+    run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
 
     t1 = time.time()
 
-    print("Coordinate matrix")
-    print(X_np)
+    # print("Coordinate matrix")
+    # print(X_np)
 
     print("\nExecution time:", (t1 - t0) * 1000, "ms")
