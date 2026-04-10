@@ -12,8 +12,7 @@ d = 70
 k = 2
 b = 32
 
-# first 1 ensures compilation time is not factored into any of the data
-Ns = [1, 1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 132, 133, 144, 160, 192, 256, 384, 512, 640, 768, 896, 1024]
+Ns = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 132, 133, 144, 160, 192, 256, 384, 512, 640, 768, 896, 1024]
 
 np.random.seed(0)
 
@@ -30,9 +29,10 @@ for N in Ns:
     Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
     Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
-    t0 = time.time()
-    run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
-    t1 = time.time()
+    for i in range(3):
+        t0 = time.time()
+        run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+        t1 = time.time()
 
     ms = (t1 - t0) * 1000
     print(f"N={N:>5} \n{ms:.3f}")
