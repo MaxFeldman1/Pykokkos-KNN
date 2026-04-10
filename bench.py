@@ -12,7 +12,8 @@ d = 70
 k = 2
 b = 32
 
-Ns = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 132, 133, 144, 160, 192, 256, 384, 512, 640, 768, 896, 1024]
+# first 1 ensures compilation time is not factored into any of the data
+Ns = [1, 1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 132, 133, 144, 160, 192, 256, 384, 512, 640, 768, 896, 1024]
 
 np.random.seed(0)
 
@@ -41,6 +42,6 @@ for N in Ns:
     lines.append("")
 
 with open("runtimes.txt", "w") as f:
-    f.write("\n".join(lines))
+    f.write("\n".join(lines[1:]))
 
 print("\nWrote runtimes.txt")
