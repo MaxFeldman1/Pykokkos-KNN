@@ -35,13 +35,13 @@ for N in Ns:
         t1 = time.time()
 
     ms = (t1 - t0) * 1000
-    print(f"N={N:>5} \n{ms:.3f}")
+    print(f"N={N}\n{ms:.3f}")
 
     lines.append(f"N={N}")
     lines.append(f"{ms}")
     lines.append("")
 
 with open("runtimes.txt", "w") as f:
-    f.write("\n".join(lines[1:]))
+    f.write("\n".join(lines))
 
 print("\nWrote runtimes.txt")
