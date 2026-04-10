@@ -10,7 +10,7 @@ import math
 device = "cpu"          # ← change to "cuda" for GPU
 
 if __name__ == '__main__':
-    N = 200       # batch size — number of datasets to process simultaneously
+    N = 2       # batch size — number of datasets to process simultaneously
     m = 2000
     d = 70
     k = 2
@@ -97,12 +97,13 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
             val: pk.float64 = Dloc[n][idx0][idx1]
             worst: pk.int32 = 0
             t: pk.int32 = 0
+            prop: pk.int32 = 0
             for t in range(1, k + 1):
-                if Ldst[n][i][t] > Ldst[n][i][worst]:
-                    worst = t
-            if val < Ldst[n][i][worst]:
-                Ldst[n][i][worst] = val
-                Lidx[n][i][worst] = j
+                prop = Ldst[n][i][t] > Ldst[n][i][worst]
+                worst = t * prop + worst * (1 - prop)
+            prop = val < Ldst[n][i][worst]
+            Ldst[n][i][worst] = val * prop + Ldst[n][i][worst] * (1 - prop)
+            Lidx[n][i][worst] = j * prop + Lidx[n][i][worst] * (1 - prop)
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
     team_member.team_barrier()
@@ -115,12 +116,13 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
             idx: pk.int32 = Lidx[n][i][s]
             worst: pk.int32 = 0
             t: pk.int32 = 0
+            prop: pk.int32 = 0
             for t in range(1, k + 1):
-                if Gdst[n][i][t] > Gdst[n][i][worst]:
-                    worst = t
-            if dst < Gdst[n][i][worst]:
-                Gdst[n][i][worst] = dst
-                Gidx[n][i][worst] = idx
+                prop = Gdst[n][i][t] > Gdst[n][i][worst]
+                worst = t * prop + worst * (1 - prop)
+            prop = dst < Gdst[n][i][worst]
+            Gdst[n][i][worst] = dst * prop + Gdst[n][i][worst] * (1 - prop)
+            Gidx[n][i][worst] = idx * prop + Gidx[n][i][worst] * (1 - prop)
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), merge_diag_body)
     team_member.team_barrier()
@@ -200,12 +202,13 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
                 idx_m: pk.int32 = Lidx[n][i_m][s_m]
                 worst_m: pk.int32 = 0
                 t_m: pk.int32 = 0
+                prop_m: pk.int32 = 0
                 for t_m in range(1, k + 1):
-                    if Gdst[n][i_m][t_m] > Gdst[n][i_m][worst_m]:
-                        worst_m = t_m
-                if dst_m < Gdst[n][i_m][worst_m]:
-                    Gdst[n][i_m][worst_m] = dst_m
-                    Gidx[n][i_m][worst_m] = idx_m
+                    prop_m = Gdst[n][i_m][t_m] > Gdst[n][i_m][worst_m]
+                    worst_m = t_m * prop_m + worst_m * (1 - prop_m)
+                prop_m = dst_m < Gdst[n][i_m][worst_m]
+                Gdst[n][i_m][worst_m] = dst_m * prop_m + Gdst[n][i_m][worst_m] * (1 - prop_m)
+                Gidx[n][i_m][worst_m] = idx_m * prop_m + Gidx[n][i_m][worst_m] * (1 - prop_m)
 
         pk.parallel_for(pk.TeamThreadRange(team_member, merge_count), merge_hblk_body)
         team_member.team_barrier()
@@ -221,10 +224,9 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
             col: pk.int32 = lin % b
             Dloc[n][row][col] = -1.0
 
-        if hblk_i < l - 1:
-            pk.parallel_for(pk.TeamThreadRange(team_member, m * (k + 1)), flush_local_h)
-            pk.parallel_for(pk.TeamThreadRange(team_member, m * b),       flush_dloc_h)
-            team_member.team_barrier()
+        pk.parallel_for(pk.TeamThreadRange(team_member, m * (k + 1)), flush_local_h)
+        pk.parallel_for(pk.TeamThreadRange(team_member, m * b),       flush_dloc_h)
+        team_member.team_barrier()
 
 
 @pk.workunit
