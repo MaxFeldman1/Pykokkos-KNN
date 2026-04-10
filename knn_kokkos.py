@@ -251,6 +251,7 @@ def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     """
     # One team per dataset — N teams run in parallel across SMs.
     pk.parallel_for(
+        "MAIN_PIPELINE",
         pk.TeamPolicy(N, pk.AUTO),
         knn_pipeline_kernel,
         X=X, Xn=Xn, Dloc=Dloc, Gdst=Gdst, Gidx=Gidx,
