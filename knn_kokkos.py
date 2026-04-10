@@ -10,8 +10,8 @@ import math
 device = "cpu"          # ← change to "cuda" for GPU
 
 if __name__ == '__main__':
-    N = 2       # batch size — number of datasets to process simultaneously
-    m = 100
+    N = 200       # batch size — number of datasets to process simultaneously
+    m = 2000
     d = 70
     k = 2
     b = 32
