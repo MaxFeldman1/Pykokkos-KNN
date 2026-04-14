@@ -8,7 +8,9 @@ import matplotlib.pyplot as plt
 params = {}
 data = {}   # N -> list of runtimes (ms)
 
-with open("runtimes.txt") as f:
+filename = 'runtimesalt.txt'
+
+with open(filename) as f:
     current_N = None
     for line in f:
         line = line.strip()
