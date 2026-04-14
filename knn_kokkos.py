@@ -228,16 +228,6 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
         pk.parallel_for(pk.TeamThreadRange(team_member, m * b),       flush_dloc_h)
         team_member.team_barrier()
 
-
-@pk.workunit
-def build_G(i, Gidx, G, k):
-    t: pk.int32 = 0
-    for t in range(k + 1):
-        j: pk.int32 = Gidx[i][t]
-        if j >= 0 and j != i:
-            G[i][j] = 1
-
-
 def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     """
     N       : number of datasets (batch size)

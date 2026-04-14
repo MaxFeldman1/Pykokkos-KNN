@@ -201,26 +201,7 @@ def topk_col_hblk(jm, Dloc, Lidx, Ldst, k, b, blknum):
         Lidx[j][worst] = i * prop + Lidx[j][worst] * (1 - prop)
 
 
-
-@pk.workunit
-def build_G(i, Gidx, G, k):
-    t: pk.int32 = 0
-    for t in range(k + 1):
-        j: pk.int32 = Gidx[i][t]
-        if j >= 0 and j != i:
-            G[i][j] = 1
-
-
 def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
-    if device == "cuda":
-        X      = X.cuda()
-        Xn     = Xn.cuda()
-        Dloc   = Dloc.cuda()
-        Gdst   = Gdst.cuda()
-        Gidx   = Gidx.cuda()
-        Ldst   = Ldst.cuda()
-        Lidx   = Lidx.cuda()
-
     l = math.ceil(m / b)
 
     pk.parallel_for("norms", m, compute_norm, X=X, Xn=Xn, d=d)
@@ -273,13 +254,23 @@ def run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
 # run
 # -----------------------------
 if __name__ == '__main__':
+    if device == "cuda":
+        import cupy as cp
+        X    = cp.asarray(X)
+        Xn   = cp.asarray(Xn)
+        Dloc = cp.asarray(Dloc)
+        Gdst = cp.asarray(Gdst)
+        Gidx = cp.asarray(Gidx)
+        Ldst = cp.asarray(Ldst)
+        Lidx = cp.asarray(Lidx)
+    
     t0 = time.time()
 
     run_knn_pipeline(m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
 
     t1 = time.time()
 
-    print("Coordinate matrix")
-    print(X_np)
+    # print("Coordinate matrix")
+    # print(X_np)
 
     print("\nExecution time:", (t1 - t0) * 1000, "ms")
