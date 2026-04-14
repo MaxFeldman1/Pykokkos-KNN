@@ -1,5 +1,10 @@
+import argparse
 import numpy as np
 import torch
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--unfused", action="store_true")
+args = parser.parse_args()
 
 # -----------------------------
 # parameters
@@ -32,7 +37,10 @@ gt_idx = knn_brute(X_np, k)
 # -----------------------------
 # helpers
 # -----------------------------
-from knn_kokkos import run_knn_pipeline
+if args.unfused:
+    from unfused_knn_kokkos import run_knn_pipeline
+else:
+    from knn_kokkos import run_knn_pipeline
 
 def fresh_tensors(N, m, b, k):
     X    = torch.from_numpy(X_np.copy())
