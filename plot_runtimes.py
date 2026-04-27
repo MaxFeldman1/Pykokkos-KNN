@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 params = {}
 data = {}   # N -> list of runtimes (ms)
 
-filename = 'runtimesalt.txt'
+filename = 'unfusedruntimes.txt'
 
 with open(filename) as f:
     current_N = None

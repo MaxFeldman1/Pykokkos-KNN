@@ -1,8 +1,23 @@
+import sys
+import argparse
 import numpy as np
 import torch
 import time
 
-from knn_kokkos import run_knn_pipeline
+parser = argparse.ArgumentParser()
+parser.add_argument("pipeline", nargs="?", default="knn_kokkos",
+                    choices=["knn_kokkos", "unfused_knn_kokkos", "gemm_knn_kokkos"],
+                    help="Which pipeline to benchmark")
+args = parser.parse_args()
+
+if args.pipeline == "unfused_knn_kokkos":
+    from unfused_knn_kokkos import run_knn_pipeline
+elif args.pipeline == "gemm_knn_kokkos":
+    from gemm_knn_kokkos import run_knn_pipeline
+else:
+    from knn_kokkos import run_knn_pipeline
+
+print(f"Benchmarking: {args.pipeline}")
 
 # -----------------------------
 # fixed parameters
