@@ -49,7 +49,7 @@ def mem_napkin_time_ms(N, m_val, d_val, k_val, b_val,
     if not INCL_MEM:
         return T_compute_ms
 
-    L2_MISS_RATE = 0.1
+    L2_MISS_RATE = 1
 
     l = int(np.ceil(m_val / b_val))
     hblk_pairs = sum(b_val * (m_val - b_val * h) for h in range(1, l))

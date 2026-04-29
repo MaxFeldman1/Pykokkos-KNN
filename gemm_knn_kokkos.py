@@ -195,18 +195,15 @@ def compute_dist_hblk_gemm(X, Xn, Dloc, b, hblk, blksize):
     A = X[:, start_i:start_i + b, :]             # (N, b, d)
     B = X[:, start_j:start_j + blksize, :]        # (N, blksize, d)
 
-    # dots[n][jm][im] = B[n][jm] · A[n][im]
-    dots = torch.bmm(B, A.transpose(1, 2))         # (N, blksize, b)
-
     Xn_A = Xn[:, start_i:start_i + b]             # (N, b)
     Xn_B = Xn[:, start_j:start_j + blksize]       # (N, blksize)
 
-    # Dloc[n][jm][im] = -2*dot + ||xi||^2 + ||xj||^2
-    Dloc[:, :blksize, :b] = (
-        -2.0 * dots
-        + Xn_A.unsqueeze(1)   # (N, 1, b) broadcasts over jm
-        + Xn_B.unsqueeze(2)   # (N, blksize, 1) broadcasts over im
-    )
+    # Write dots directly into Dloc, then fix up in-place
+    out = Dloc[:, :blksize, :b]
+    torch.bmm(B, A.transpose(1, 2), out=out)       # out[n][jm][im] = B[n][jm] · A[n][im]
+    out.mul_(-2.0)
+    out.add_(Xn_A.unsqueeze(1))                    # + ||xi||^2, broadcast over jm
+    out.add_(Xn_B.unsqueeze(2))                    # + ||xj||^2, broadcast over im
 
 
 def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
