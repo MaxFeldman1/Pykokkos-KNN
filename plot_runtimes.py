@@ -69,6 +69,31 @@ def mem_napkin_time_ms(N, m_val, d_val, k_val, b_val,
     return T_compute_ms + T_mem_ms
 
 
+def non_hblk_napkin_time_ms(N, m_val, d_val, k_val, b_val,
+                             TFLOPS_TOTAL=33.5e12, HBM_BW=4e12):
+    """Time for everything except the hblk distance kernel (norms + topk + merge + flush)."""
+    L2_MISS_RATE = 0.1
+    pairs_per_ds = (m_val - 1) * m_val / 2
+    flops_norms  = m_val * (2 * d_val)
+    flops_topk   = pairs_per_ds * (k_val + 1) * 2
+    FLOPS_NON_HBLK = flops_norms + flops_topk
+
+    l = int(np.ceil(m_val / b_val))
+    hblk_pairs = sum(b_val * (m_val - b_val * h) for h in range(1, l))
+
+    # All bytes except the dominant hblk X[i]+X[j] reads
+    non_hblk_bytes = (
+        hblk_pairs * 2 * 8                # hblk: Xn[i] + Xn[j] per pair
+        + hblk_pairs * 8                   # Dloc write (dist kernel) + read (topk kernel)
+        + m_val * d_val * 8                # norm phase: X read once
+        + m_val * (k_val + 1) * 8 * 4     # topk/merge: Gdst, Gidx, Ldst, Lidx
+    )
+
+    T_compute_ms = N * FLOPS_NON_HBLK / TFLOPS_TOTAL * 1e3
+    T_mem_ms     = N * non_hblk_bytes * L2_MISS_RATE / HBM_BW * 1e3
+    return T_compute_ms + T_mem_ms
+
+
 def napkin_time_ms(N, m_val, d_val, k_val, b_val,
                    TFLOPS_TOTAL=33.5e12, N_SMs=132):
     FLOPS_PER_SM = TFLOPS_TOTAL / N_SMs
@@ -111,12 +136,13 @@ for name, (params, _) in all_data.items():
 all_Ns = sorted({n for _, (_, d) in all_data.items() for n in d})
 N_model = np.array(sorted(set(all_Ns + list(range(1, max(all_Ns) + 1, max(1, max(all_Ns) // 200))))))
 
-napkin_lines = {}   # key -> (t_compute_only, t_with_mem)
+napkin_lines = {}   # key -> (t_compute_only, t_with_mem, t_non_hblk)
 for key in seen_params:
     m_val, d_val, k_val, b_val = key
-    t_no_mem  = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=False) for n in N_model])
+    t_no_mem   = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=False) for n in N_model])
     t_with_mem = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=True)  for n in N_model])
-    napkin_lines[key] = (t_no_mem, t_with_mem)
+    t_non_hblk = np.array([non_hblk_napkin_time_ms(n, m_val, d_val, k_val, b_val)            for n in N_model])
+    napkin_lines[key] = (t_no_mem, t_with_mem, t_non_hblk)
 
 # -----------------------------
 # plot
@@ -135,7 +161,7 @@ for name, fname, color, marker in pipelines:
                 label=f'{name}  (m={params["m"]})')
 
 napkin_colors = ['tomato', 'purple', 'gold']
-for i, (key, (t_no_mem, t_with_mem)) in enumerate(napkin_lines.items()):
+for i, (key, (t_no_mem, t_with_mem, t_non_hblk)) in enumerate(napkin_lines.items()):
     m_val, d_val, k_val, b_val = key
     names = ', '.join(seen_params[key])
     color = napkin_colors[i % len(napkin_colors)]
@@ -143,6 +169,8 @@ for i, (key, (t_no_mem, t_with_mem)) in enumerate(napkin_lines.items()):
             label=f'Napkin compute-only  m={m_val}  [{names}]')
     ax.plot(N_model, t_with_mem, ':', color=color, linewidth=2.0,
             label=f'Napkin compute+mem   m={m_val}  [{names}]')
+    ax.plot(N_model, t_non_hblk, '-.', color=color, linewidth=1.5,
+            label=f'Napkin non-hblk      m={m_val}  [{names}]')
 
 N_SMs = 132
 ax.axvline(N_SMs, color='gray', linestyle=':', linewidth=1)

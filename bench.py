@@ -42,8 +42,10 @@ if args.pipeline == "cpp":
         or os.path.getmtime(fiknn) > os.path.getmtime(binary)
     )
     if needs_build:
+        knn_dir = os.path.dirname(os.path.abspath(src))
         compile_cmd = [
             "nvcc",
+            f"-I{knn_dir}",     # our helper_cuda.h stub takes priority
             f"-I{helper_inc}", f"-I{inc}",
             fiknn, src,
             "-O2", "-o", binary,
