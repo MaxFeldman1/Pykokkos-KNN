@@ -111,9 +111,10 @@ def napkin_time_ms(N, m_val, d_val, k_val, b_val,
 # load all three files
 # -----------------------------
 pipelines = [
-    ('fused',   'fused_runtimes.txt',   'steelblue',  'o'),
-    ('unfused', 'unfused_runtimes.txt', 'darkorange', 's'),
-    ('gemm',    'gemm_runtimes.txt',    'mediumseagreen', '^'),
+    ('fused',   'fused_runtimes.txt',   'steelblue',       'o'),
+    ('unfused', 'unfused_runtimes.txt', 'darkorange',      's'),
+    ('gemm',    'gemm_runtimes.txt',    'mediumseagreen',  '^'),
+    ('cpp',     'cpp_runtimes.txt',     'mediumpurple',    'D'),
 ]
 
 all_data   = {}   # name -> (params, {N: [runtimes]})
