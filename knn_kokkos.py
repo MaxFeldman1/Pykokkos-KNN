@@ -108,21 +108,42 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
     pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
     team_member.team_barrier()
 
-    # ---- Phase 4: merge diagonal locals into global ----
+    # ---- Phase 4: merge diagonal locals into global max-heap ----
+    # Gdst[n][i][0..k-1] is a max-heap: root (index 0) is always the worst
+    # (largest) distance, so inserting a new candidate costs O(1) compare +
+    # O(log k) sift-down instead of O(k) linear scan.
+    # NEGINF is used as a sentinel so invalid (out-of-bounds) children never win.
+    NEGINF: pk.float64 = -1.7976931348623157e+308
     def merge_diag_body(i: int):
         s: pk.int32 = 0
         for s in range(k + 1):
             dst: pk.float64 = Ldst[n][i][s]
             idx: pk.int32 = Lidx[n][i][s]
-            worst: pk.int32 = 0
-            t: pk.int32 = 0
-            prop: pk.int32 = 0
-            for t in range(1, k + 1):
-                prop = Gdst[n][i][t] > Gdst[n][i][worst]
-                worst = t * prop + worst * (1 - prop)
-            prop = dst < Gdst[n][i][worst]
-            Gdst[n][i][worst] = dst * prop + Gdst[n][i][worst] * (1 - prop)
-            Gidx[n][i][worst] = idx * prop + Gidx[n][i][worst] * (1 - prop)
+            # only replace root when candidate is strictly better
+            prop: pk.int32 = dst < Gdst[n][i][0]
+            Gdst[n][i][0] = dst * prop + Gdst[n][i][0] * (1 - prop)
+            Gidx[n][i][0] = idx * prop + Gidx[n][i][0] * (1 - prop)
+            # sift root down to restore max-heap (no-op when prop==0)
+            hp: pk.int32 = 0
+            hstep: pk.int32 = 0
+            for hstep in range(k):
+                hl: pk.int32 = 2 * hp + 1
+                hr: pk.int32 = 2 * hp + 2
+                hl_ok: pk.int32 = hl < k
+                hr_ok: pk.int32 = hr < k
+                hl_val: pk.float64 = Gdst[n][i][hl * hl_ok] * hl_ok + NEGINF * (1 - hl_ok)
+                hr_val: pk.float64 = Gdst[n][i][hr * hr_ok] * hr_ok + NEGINF * (1 - hr_ok)
+                cur_g: pk.float64 = Gdst[n][i][hp]
+                l_wins: pk.int32 = (hl_val > cur_g) * (hl_val >= hr_val)
+                r_wins: pk.int32 = (hr_val > cur_g) * (hr_val > hl_val)
+                sw: pk.int32 = hl * l_wins + hr * r_wins + hp * (1 - l_wins - r_wins)
+                tmp_d: pk.float64 = Gdst[n][i][hp]
+                tmp_i: pk.int32 = Gidx[n][i][hp]
+                Gdst[n][i][hp] = Gdst[n][i][sw]
+                Gidx[n][i][hp] = Gidx[n][i][sw]
+                Gdst[n][i][sw] = tmp_d
+                Gidx[n][i][sw] = tmp_i
+                hp = sw
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), merge_diag_body)
     team_member.team_barrier()
@@ -200,15 +221,29 @@ def knn_pipeline_kernel(team_member: pk.TeamMember, X, Xn, Dloc, Gdst, Gidx, Lds
             for s_m in range(k + 1):
                 dst_m: pk.float64 = Ldst[n][i_m][s_m]
                 idx_m: pk.int32 = Lidx[n][i_m][s_m]
-                worst_m: pk.int32 = 0
-                t_m: pk.int32 = 0
-                prop_m: pk.int32 = 0
-                for t_m in range(1, k + 1):
-                    prop_m = Gdst[n][i_m][t_m] > Gdst[n][i_m][worst_m]
-                    worst_m = t_m * prop_m + worst_m * (1 - prop_m)
-                prop_m = dst_m < Gdst[n][i_m][worst_m]
-                Gdst[n][i_m][worst_m] = dst_m * prop_m + Gdst[n][i_m][worst_m] * (1 - prop_m)
-                Gidx[n][i_m][worst_m] = idx_m * prop_m + Gidx[n][i_m][worst_m] * (1 - prop_m)
+                prop_m: pk.int32 = dst_m < Gdst[n][i_m][0]
+                Gdst[n][i_m][0] = dst_m * prop_m + Gdst[n][i_m][0] * (1 - prop_m)
+                Gidx[n][i_m][0] = idx_m * prop_m + Gidx[n][i_m][0] * (1 - prop_m)
+                hp_m: pk.int32 = 0
+                hstep_m: pk.int32 = 0
+                for hstep_m in range(k):
+                    hl_m: pk.int32 = 2 * hp_m + 1
+                    hr_m: pk.int32 = 2 * hp_m + 2
+                    hl_ok_m: pk.int32 = hl_m < k
+                    hr_ok_m: pk.int32 = hr_m < k
+                    hl_val_m: pk.float64 = Gdst[n][i_m][hl_m * hl_ok_m] * hl_ok_m + NEGINF * (1 - hl_ok_m)
+                    hr_val_m: pk.float64 = Gdst[n][i_m][hr_m * hr_ok_m] * hr_ok_m + NEGINF * (1 - hr_ok_m)
+                    cur_m: pk.float64 = Gdst[n][i_m][hp_m]
+                    l_wins_m: pk.int32 = (hl_val_m > cur_m) * (hl_val_m >= hr_val_m)
+                    r_wins_m: pk.int32 = (hr_val_m > cur_m) * (hr_val_m > hl_val_m)
+                    sw_m: pk.int32 = hl_m * l_wins_m + hr_m * r_wins_m + hp_m * (1 - l_wins_m - r_wins_m)
+                    tmp_d_m: pk.float64 = Gdst[n][i_m][hp_m]
+                    tmp_i_m: pk.int32 = Gidx[n][i_m][hp_m]
+                    Gdst[n][i_m][hp_m] = Gdst[n][i_m][sw_m]
+                    Gidx[n][i_m][hp_m] = Gidx[n][i_m][sw_m]
+                    Gdst[n][i_m][sw_m] = tmp_d_m
+                    Gidx[n][i_m][sw_m] = tmp_i_m
+                    hp_m = sw_m
 
         pk.parallel_for(pk.TeamThreadRange(team_member, merge_count), merge_hblk_body)
         team_member.team_barrier()
