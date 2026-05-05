@@ -46,14 +46,14 @@ def fresh_tensors(N, m, b, k):
     X    = torch.from_numpy(X_np.copy())
     Xn   = torch.empty((N, m), dtype=torch.float64)
     Dloc = torch.zeros((N, m, b), dtype=torch.float64)
-    Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-    Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
-    Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-    Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
+    Gdst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Lidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
+    Ldst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
     return X, Xn, Dloc, Gidx, Gdst, Lidx, Ldst
 
 def extract_knn(Gidx, Gdst, N, m, k):
-    Gidx_np = Gidx.numpy().astype(np.int32)   # (N, m, k+1)
+    Gidx_np = Gidx.numpy().astype(np.int32)   # (N, m, k)
     Gdst_np = Gdst.numpy()
     result = np.full((N, m, k), -1, dtype=np.int32)
     for n in range(N):

@@ -91,13 +91,14 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             idx0: pk.int32 = i * i_first + j * (1 - i_first)
             idx1: pk.int32 = jm * i_first + im * (1 - i_first)
             val: pk.float64 = Dloc[n][idx0][idx1]
+            not_self: pk.int32 = j != i
             worst: pk.int32 = 0
             t: pk.int32 = 0
             prop: pk.int32 = 0
             for t in range(1, k):
                 prop = Ldst[n][i][t] > Ldst[n][i][worst]
                 worst = t * prop + worst * (1 - prop)
-            prop = val < Ldst[n][i][worst]
+            prop = not_self * (val < Ldst[n][i][worst])
             Ldst[n][i][worst] = val * prop + Ldst[n][i][worst] * (1 - prop)
             Lidx[n][i][worst] = j * prop + Lidx[n][i][worst] * (1 - prop)
 
