@@ -69,14 +69,12 @@ for d in ds:
         X    = torch.from_numpy(X_np)
         Xn   = torch.empty((N, m), dtype=torch.float64)
         Dloc = torch.zeros((N, m, b), dtype=torch.float64)
-        Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
-        Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+        Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
+        Gdst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
 
         for i in range(3):
             t0 = time.time()
-            run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+            run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx)
             t1 = time.time()
 
         elapsed_s = t1 - t0

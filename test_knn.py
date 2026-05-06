@@ -48,9 +48,7 @@ def fresh_tensors(N, m, b, k):
     Dloc = torch.zeros((N, m, b), dtype=torch.float64)
     Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
     Gdst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
-    Lidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
-    Ldst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
-    return X, Xn, Dloc, Gidx, Gdst, Lidx, Ldst
+    return X, Xn, Dloc, Gidx, Gdst
 
 def extract_knn(Gidx, Gdst, N, m, k):
     Gidx_np = Gidx.numpy().astype(np.int32)   # (N, m, k)
@@ -93,8 +91,8 @@ def compare(pred, gt, X_np, N, m, k, label):
 # -----------------------------
 # run
 # -----------------------------
-X, Xn, Dloc, Gidx, Gdst, Lidx, Ldst = fresh_tensors(N, m, b, k)
-run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+X, Xn, Dloc, Gidx, Gdst = fresh_tensors(N, m, b, k)
+run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx)
 pred = extract_knn(Gidx, Gdst, N, m, k)
 
 print(f"N={N}  m={m}  d={d}  k={k}  b={b}")
