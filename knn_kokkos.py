@@ -38,6 +38,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
                         m, d, k, b):
     INF: pk.float64 = 1.7976931348623157e+308
     n: pk.int32 = team_member.league_rank()
+    n2k: pk.int32 = 2 * k
 
     # ---- Phase 1: norms ----
     def norm_body(i: int):
@@ -105,45 +106,46 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
     pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
     team_member.team_barrier()
 
-    # ---- Phase 4: bitonic-sort merge diagonal locals into global ----
-    # Sbuf[0..k-1]   ← Gdst[i][0..k-1]  (current k-best)
-    # Sbuf[k..2k-1]  ← Ldst[i][0..k-1]  (new k candidates)
-    # Sort Sbuf ascending; first k entries become the new Gdst.
-    # k must be a power of 2 so 2k is also a power of 2.
-    def merge_diag_body(i: int):
-        p: pk.int32 = 0
-        for p in range(k):
-            Sbuf_d[n][i][p]     = Gdst[n][i][p]
-            Sbuf_i[n][i][p]     = Gidx[n][i][p]
-            Sbuf_d[n][i][p + k] = Ldst[n][i][p]
-            Sbuf_i[n][i][p + k] = Lidx[n][i][p]
-        n2k: pk.int32 = 2 * k
-        g: pk.int32 = 2
-        while g <= n2k:
-            h: pk.int32 = g >> 1
-            while h >= 1:
-                j_s: pk.int32 = 0
-                for j_s in range(n2k):
-                    ixj: pk.int32   = j_s ^ h
-                    do_cmp: pk.int32 = ixj > j_s
-                    asc: pk.int32   = (j_s & g) == 0
-                    d_j:   pk.float64 = Sbuf_d[n][i][j_s]
-                    d_ixj: pk.float64 = Sbuf_d[n][i][ixj]
-                    ns: pk.int32 = do_cmp * (asc * (d_j > d_ixj) + (1 - asc) * (d_j < d_ixj))
-                    tmp_d: pk.float64 = d_j
-                    tmp_i: pk.int32   = Sbuf_i[n][i][j_s]
-                    Sbuf_d[n][i][j_s] = d_j   * (1 - ns) + d_ixj             * ns
-                    Sbuf_i[n][i][j_s] = tmp_i * (1 - ns) + Sbuf_i[n][i][ixj] * ns
-                    Sbuf_d[n][i][ixj] = d_ixj * (1 - ns) + tmp_d             * ns
-                    Sbuf_i[n][i][ixj] = Sbuf_i[n][i][ixj] * (1 - ns) + tmp_i * ns
-                h = h >> 1
-            g = g * 2
-        for p in range(k):
-            Gdst[n][i][p] = Sbuf_d[n][i][p]
-            Gidx[n][i][p] = Sbuf_i[n][i][p]
+    # ---- Phase 4: collaborative bitonic merge — diagonal ----
+    # Rows processed serially; each sort stage is parallel across team threads.
+    # Sbuf is (N, 2k): one shared scratch slot per dataset, reused each row.
+    row_d: pk.int32 = 0
+    for row_d in range(m):
+        def load_diag(p: int):
+            Sbuf_d[n][p]     = Gdst[n][row_d][p]
+            Sbuf_i[n][p]     = Gidx[n][row_d][p]
+            Sbuf_d[n][p + k] = Ldst[n][row_d][p]
+            Sbuf_i[n][p + k] = Lidx[n][row_d][p]
+        pk.parallel_for(pk.TeamThreadRange(team_member, k), load_diag)
+        team_member.team_barrier()
 
-    pk.parallel_for(pk.TeamThreadRange(team_member, m), merge_diag_body)
-    team_member.team_barrier()
+        g_d: pk.int32 = 2
+        while g_d <= n2k:
+            h_d: pk.int32 = g_d >> 1
+            while h_d >= 1:
+                def sort_diag(j_s: int):
+                    ixj_d: pk.int32   = j_s ^ h_d
+                    do_cmp_d: pk.int32 = ixj_d > j_s
+                    asc_d: pk.int32   = (j_s & g_d) == 0
+                    d_j_d:   pk.float64 = Sbuf_d[n][j_s]
+                    d_ixj_d: pk.float64 = Sbuf_d[n][ixj_d]
+                    ns_d: pk.int32 = do_cmp_d * (asc_d * (d_j_d > d_ixj_d) + (1 - asc_d) * (d_j_d < d_ixj_d))
+                    tmp_d_d: pk.float64 = d_j_d
+                    tmp_i_d: pk.int32   = Sbuf_i[n][j_s]
+                    Sbuf_d[n][j_s]    = d_j_d   * (1 - ns_d) + d_ixj_d            * ns_d
+                    Sbuf_i[n][j_s]    = tmp_i_d * (1 - ns_d) + Sbuf_i[n][ixj_d]   * ns_d
+                    Sbuf_d[n][ixj_d]  = d_ixj_d * (1 - ns_d) + tmp_d_d            * ns_d
+                    Sbuf_i[n][ixj_d]  = Sbuf_i[n][ixj_d] * (1 - ns_d) + tmp_i_d  * ns_d
+                pk.parallel_for(pk.TeamThreadRange(team_member, n2k), sort_diag)
+                team_member.team_barrier()
+                h_d = h_d >> 1
+            g_d = g_d * 2
+
+        def store_diag(p: int):
+            Gdst[n][row_d][p] = Sbuf_d[n][p]
+            Gidx[n][row_d][p] = Sbuf_i[n][p]
+        pk.parallel_for(pk.TeamThreadRange(team_member, k), store_diag)
+        team_member.team_barrier()
 
     # ---- flush Ldst / Lidx (k slots) and Dloc ----
     def flush_local(lin: int):
@@ -212,41 +214,44 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
         merge_count: pk.int32 = m - b * (hblk_i - 1)
         merge_off: pk.int32 = b * (hblk_i - 1)
 
-        def merge_hblk_body(lin_m: int):
-            i_m: pk.int32 = lin_m + merge_off
-            p_m: pk.int32 = 0
-            for p_m in range(k):
-                Sbuf_d[n][i_m][p_m]     = Gdst[n][i_m][p_m]
-                Sbuf_i[n][i_m][p_m]     = Gidx[n][i_m][p_m]
-                Sbuf_d[n][i_m][p_m + k] = Ldst[n][i_m][p_m]
-                Sbuf_i[n][i_m][p_m + k] = Lidx[n][i_m][p_m]
-            n2k_m: pk.int32 = 2 * k
-            g_m: pk.int32 = 2
-            while g_m <= n2k_m:
-                h_m: pk.int32 = g_m >> 1
-                while h_m >= 1:
-                    j_m: pk.int32 = 0
-                    for j_m in range(n2k_m):
-                        ixj_m: pk.int32   = j_m ^ h_m
-                        do_cmp_m: pk.int32 = ixj_m > j_m
-                        asc_m: pk.int32   = (j_m & g_m) == 0
-                        d_j_m:   pk.float64 = Sbuf_d[n][i_m][j_m]
-                        d_ixj_m: pk.float64 = Sbuf_d[n][i_m][ixj_m]
-                        ns_m: pk.int32 = do_cmp_m * (asc_m * (d_j_m > d_ixj_m) + (1 - asc_m) * (d_j_m < d_ixj_m))
-                        tmp_d_m: pk.float64 = d_j_m
-                        tmp_i_m: pk.int32   = Sbuf_i[n][i_m][j_m]
-                        Sbuf_d[n][i_m][j_m]  = d_j_m   * (1 - ns_m) + d_ixj_m              * ns_m
-                        Sbuf_i[n][i_m][j_m]  = tmp_i_m * (1 - ns_m) + Sbuf_i[n][i_m][ixj_m] * ns_m
-                        Sbuf_d[n][i_m][ixj_m] = d_ixj_m * (1 - ns_m) + tmp_d_m              * ns_m
-                        Sbuf_i[n][i_m][ixj_m] = Sbuf_i[n][i_m][ixj_m] * (1 - ns_m) + tmp_i_m * ns_m
-                    h_m = h_m >> 1
-                g_m = g_m * 2
-            for p_m in range(k):
-                Gdst[n][i_m][p_m] = Sbuf_d[n][i_m][p_m]
-                Gidx[n][i_m][p_m] = Sbuf_i[n][i_m][p_m]
+        row_h: pk.int32 = 0
+        for row_h in range(merge_count):
+            i_mh: pk.int32 = row_h + merge_off
+            def load_hblk(p: int):
+                Sbuf_d[n][p]     = Gdst[n][i_mh][p]
+                Sbuf_i[n][p]     = Gidx[n][i_mh][p]
+                Sbuf_d[n][p + k] = Ldst[n][i_mh][p]
+                Sbuf_i[n][p + k] = Lidx[n][i_mh][p]
+            pk.parallel_for(pk.TeamThreadRange(team_member, k), load_hblk)
+            team_member.team_barrier()
 
-        pk.parallel_for(pk.TeamThreadRange(team_member, merge_count), merge_hblk_body)
-        team_member.team_barrier()
+            g_h: pk.int32 = 2
+            while g_h <= n2k:
+                h_h: pk.int32 = g_h >> 1
+                while h_h >= 1:
+                    def sort_hblk(j_s: int):
+                        ixj_h: pk.int32    = j_s ^ h_h
+                        do_cmp_h: pk.int32 = ixj_h > j_s
+                        asc_h: pk.int32    = (j_s & g_h) == 0
+                        d_j_h:   pk.float64 = Sbuf_d[n][j_s]
+                        d_ixj_h: pk.float64 = Sbuf_d[n][ixj_h]
+                        ns_h: pk.int32 = do_cmp_h * (asc_h * (d_j_h > d_ixj_h) + (1 - asc_h) * (d_j_h < d_ixj_h))
+                        tmp_d_h: pk.float64 = d_j_h
+                        tmp_i_h: pk.int32   = Sbuf_i[n][j_s]
+                        Sbuf_d[n][j_s]   = d_j_h   * (1 - ns_h) + d_ixj_h           * ns_h
+                        Sbuf_i[n][j_s]   = tmp_i_h * (1 - ns_h) + Sbuf_i[n][ixj_h]  * ns_h
+                        Sbuf_d[n][ixj_h] = d_ixj_h * (1 - ns_h) + tmp_d_h           * ns_h
+                        Sbuf_i[n][ixj_h] = Sbuf_i[n][ixj_h] * (1 - ns_h) + tmp_i_h * ns_h
+                    pk.parallel_for(pk.TeamThreadRange(team_member, n2k), sort_hblk)
+                    team_member.team_barrier()
+                    h_h = h_h >> 1
+                g_h = g_h * 2
+
+            def store_hblk(p: int):
+                Gdst[n][i_mh][p] = Sbuf_d[n][p]
+                Gidx[n][i_mh][p] = Sbuf_i[n][p]
+            pk.parallel_for(pk.TeamThreadRange(team_member, k), store_hblk)
+            team_member.team_barrier()
 
         def flush_local_h(lin: int):
             row: pk.int32 = lin // k
@@ -271,8 +276,8 @@ def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     Ldst, Lidx   : (N, m, k)   — local block candidates
     k must be a power of 2.
     """
-    Sbuf_d = torch.empty((N, m, 2 * k), dtype=torch.float64)
-    Sbuf_i = torch.empty((N, m, 2 * k), dtype=torch.int32)
+    Sbuf_d = torch.empty((N, 2 * k), dtype=torch.float64)
+    Sbuf_i = torch.empty((N, 2 * k), dtype=torch.int32)
     pk.parallel_for(
         "MAIN_PIPELINE",
         pk.TeamPolicy(N, pk.AUTO),
