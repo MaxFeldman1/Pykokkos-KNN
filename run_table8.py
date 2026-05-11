@@ -40,6 +40,7 @@ if args.pipeline == "original":
     )
     if needs_build:
         cmd = ["nvcc", f"-I{knn_dir}", f"-I{helper_inc}", f"-I{inc}",
+               "-gencode", "arch=compute_90,code=sm_90",
                fiknn, src, "-O2", "-o", binary]
         print("Compiling:", " ".join(cmd))
         r = subprocess.run(cmd)
