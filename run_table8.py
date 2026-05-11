@@ -28,10 +28,8 @@ if args.pipeline == "original":
     knn_dir    = os.path.dirname(os.path.abspath(__file__))
     src        = os.path.join(knn_dir, "table8_bench.cu")
     binary     = os.path.join(knn_dir, "table8_bench")
-    fiknn      = os.path.join(knn_dir, "../pyrknn/GeMM/src/FIKNN_dense.cu")
-    inc        = os.path.join(knn_dir, "../pyrknn/GeMM/include")
-    cuda_home  = os.environ.get("CUDA_HOME") or os.environ.get("TACC_CUDA_DIR") or "/usr/local/cuda"
-    helper_inc = os.path.join(cuda_home, "samples/common/inc")
+    fiknn      = os.path.join(knn_dir, "../pyrknn/GeMM/pysrc/filknn/dense/dfiknn_test.cu")
+    inc        = os.path.join(knn_dir, "../pyrknn/GeMM/pysrc/filknn/dense")
 
     needs_build = (
         not os.path.exists(binary)
@@ -39,9 +37,9 @@ if args.pipeline == "original":
         or os.path.getmtime(fiknn) > os.path.getmtime(binary)
     )
     if needs_build:
-        cmd = ["nvcc", f"-I{knn_dir}", f"-I{helper_inc}", f"-I{inc}",
+        cmd = ["nvcc", f"-I{knn_dir}", f"-I{inc}",
                "-gencode", "arch=compute_90,code=sm_90",
-               fiknn, src, "-O2", "-o", binary]
+               fiknn, src, "-O2", "-lcublas", "-o", binary]
         print("Compiling:", " ".join(cmd))
         r = subprocess.run(cmd)
         if r.returncode != 0:
