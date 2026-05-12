@@ -14,7 +14,6 @@ args = parser.parse_args()
 M  = 4_000_000
 N  = 2_000    # leaves
 m  = M // N   # 2000 pts per leaf
-b  = 32
 ds = [4, 16, 64]
 ks = [16, 64]
 
@@ -28,10 +27,8 @@ if args.pipeline == "original":
     knn_dir    = os.path.dirname(os.path.abspath(__file__))
     src        = os.path.join(knn_dir, "table8_bench.cu")
     binary     = os.path.join(knn_dir, "table8_bench")
-    fiknn      = os.path.join(knn_dir, "../pyrknn/GeMM/src/FIKNN_dense.cu")
-    inc        = os.path.join(knn_dir, "../pyrknn/GeMM/include")
-    cuda_home  = os.environ.get("CUDA_HOME") or os.environ.get("TACC_CUDA_DIR") or "/usr/local/cuda"
-    helper_inc = os.path.join(cuda_home, "samples/common/inc")
+    fiknn      = os.path.join(knn_dir, "../pyrknn/GeMM/pysrc/filknn/dense/dfiknn_test.cu")
+    inc        = os.path.join(knn_dir, "../pyrknn/GeMM/pysrc/filknn/dense")
 
     needs_build = (
         not os.path.exists(binary)
@@ -39,8 +36,9 @@ if args.pipeline == "original":
         or os.path.getmtime(fiknn) > os.path.getmtime(binary)
     )
     if needs_build:
-        cmd = ["nvcc", f"-I{knn_dir}", f"-I{helper_inc}", f"-I{inc}",
-               fiknn, src, "-O2", "-o", binary]
+        cmd = ["nvcc", f"-I{knn_dir}", f"-I{inc}",
+               "-gencode", "arch=compute_90,code=sm_90",
+               fiknn, src, "-O2", "-lcublas", "-o", binary]
         print("Compiling:", " ".join(cmd))
         r = subprocess.run(cmd)
         if r.returncode != 0:
@@ -64,19 +62,18 @@ print(f"{'-------':>10}  {'–':>6}  {'---------':>12}")
 
 for d in ds:
     for k in ks:
+        b    = max(32, k)
         np.random.seed(42)
         X_np = np.random.randn(N, m, d).astype(np.float64)
         X    = torch.from_numpy(X_np)
         Xn   = torch.empty((N, m), dtype=torch.float64)
         Dloc = torch.zeros((N, m, b), dtype=torch.float64)
-        Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
-        Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+        Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
+        Gdst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
 
         for i in range(3):
             t0 = time.time()
-            run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+            run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx)
             t1 = time.time()
 
         elapsed_s = t1 - t0

@@ -1,9 +1,5 @@
-// Reproduce Table 8: Time Breakdown for Exact Search GPU Kernels on Dense Coordinates
-// M = 4M points (N=2000 leaves, m=2000 per leaf), d in {4,16,64}, k in {16,64}
-//
-// Compile from KNN/ with:
-//   nvcc -I. -I${CUDA_HOME}/samples/common/inc -I../pyrknn/GeMM/include \
-//        ../pyrknn/GeMM/src/FIKNN_dense.cu table8_bench.cu -O2 -o table8_bench
+// Reproduce Table 8 using dfi_leafknn from dfiknn_test.cu (the implementation
+// actually used in the paper, with GPU-side sort precomputation via PrecompMergeNP2).
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,9 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cuda_runtime.h>
-
-void FIKNN_gpu_dense(float *data, int *G_Id, int M, int leaves, int k,
-                     float *knn, int *knn_Id, int d);
+#include "dfiknn.h"
 
 // Box-Muller: N(0,1) sample
 static float randn_bm(void) {
@@ -23,22 +17,8 @@ static float randn_bm(void) {
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265358979f * u2);
 }
 
-static void suppress_stdout(int *saved) {
-    fflush(stdout);
-    *saved = dup(STDOUT_FILENO);
-    int nfd = open("/dev/null", O_WRONLY);
-    dup2(nfd, STDOUT_FILENO);
-    close(nfd);
-}
-
-static void restore_stdout(int saved) {
-    fflush(stdout);
-    dup2(saved, STDOUT_FILENO);
-    close(saved);
-}
-
-static char *capture_stdout(void (*fn)(float*, int*, int, int, int, float*, int*, int),
-                             float *a, int *b, int M, int N, int k, float *c, int *d, int dim) {
+static char *capture_stdout(void (*fn)(float*, int*, int, int, int, float*, int*, int, int),
+                             float *a, int *b, int M, int N, int k, float *c, int *d, int dim, int dev) {
     int pipefd[2];
     pipe(pipefd);
     fflush(stdout);
@@ -46,24 +26,24 @@ static char *capture_stdout(void (*fn)(float*, int*, int, int, int, float*, int*
     dup2(pipefd[1], STDOUT_FILENO);
     close(pipefd[1]);
 
-    fn(a, b, M, N, k, c, d, dim);
+    fn(a, b, M, N, k, c, d, dim, dev);
     fflush(stdout);
 
     dup2(saved, STDOUT_FILENO);
     close(saved);
 
-    char *buf = (char*)malloc(8192);
-    ssize_t n = read(pipefd[0], buf, 8191);
+    char *buf = (char*)malloc(16384);
+    ssize_t n = read(pipefd[0], buf, 16383);
     buf[n < 0 ? 0 : n] = '\0';
     close(pipefd[0]);
     return buf;
 }
 
 static float run_one(int M, int N, int k, int d) {
-    size_t data_bytes   = (size_t)M * d * sizeof(float);
-    size_t knn_bytes    = (size_t)M * k * sizeof(float);
-    size_t knnid_bytes  = (size_t)M * k * sizeof(int);
-    size_t gid_bytes    = (size_t)M     * sizeof(int);
+    size_t data_bytes  = (size_t)M * d * sizeof(float);
+    size_t knn_bytes   = (size_t)M * k * sizeof(float);
+    size_t knnid_bytes = (size_t)M * k * sizeof(int);
+    size_t gid_bytes   = (size_t)M     * sizeof(int);
 
     float *h_data = (float*)malloc(data_bytes);
     int   *h_G_Id = (int*)  malloc(gid_bytes);
@@ -74,32 +54,35 @@ static float run_one(int M, int N, int k, int d) {
     for (int i = 0; i < M; i++) h_G_Id[i] = i;
 
     float *d_data, *d_knn;
-    int   *d_G_Id,  *d_knn_Id;
+    int   *d_G_Id, *d_knn_Id;
     cudaMalloc(&d_data,   data_bytes);
     cudaMalloc(&d_G_Id,   gid_bytes);
     cudaMalloc(&d_knn,    knn_bytes);
     cudaMalloc(&d_knn_Id, knnid_bytes);
+    cudaMemset(d_knn,    0, knn_bytes);
+    cudaMemset(d_knn_Id, 0, knnid_bytes);
     cudaMemcpy(d_data, h_data, data_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_G_Id, h_G_Id, gid_bytes,  cudaMemcpyHostToDevice);
 
-    // warm-up iterations
+    // warm-up
     for (int iter = 0; iter < 2; iter++) {
-        int sv;
-        suppress_stdout(&sv);
-        FIKNN_gpu_dense(d_data, d_G_Id, M, N, k, d_knn, d_knn_Id, d);
-        restore_stdout(sv);
+        char *out = capture_stdout(dfi_leafknn,
+                                   d_data, d_G_Id, M, N, k, d_knn, d_knn_Id, d, 0);
+        free(out);
+        cudaMemset(d_knn,    0, knn_bytes);
+        cudaMemset(d_knn_Id, 0, knnid_bytes);
     }
 
-    // timed iteration — parse FIKNN's internal CUDA-event elapsed time
-    char *out = capture_stdout(FIKNN_gpu_dense,
-                               d_data, d_G_Id, M, N, k, d_knn, d_knn_Id, d);
+    // timed run — parse " Total = <seconds>" from dfi_leafknn's output
+    char *out = capture_stdout(dfi_leafknn,
+                               d_data, d_G_Id, M, N, k, d_knn, d_knn_Id, d, 0);
 
     float elapsed_s = -1.0f;
-    char *ptr = strstr(out, "Elapsed time (s)");
+    char *ptr = strstr(out, " Total = ");
     if (ptr)
-        sscanf(ptr, "Elapsed time (s) : %f", &elapsed_s);
+        sscanf(ptr, " Total = %f", &elapsed_s);
     else
-        fprintf(stderr, "Warning: could not parse elapsed time (d=%d k=%d)\n", d, k);
+        fprintf(stderr, "Warning: could not parse Total time (d=%d k=%d)\nOutput:\n%s\n", d, k, out);
     free(out);
 
     cudaFree(d_data); cudaFree(d_G_Id); cudaFree(d_knn); cudaFree(d_knn_Id);
@@ -108,14 +91,13 @@ static float run_one(int M, int N, int k, int d) {
 }
 
 int main(void) {
-    // Table 8: 4M total points split into 2000 leaves of 2000 points each
     const int M = 4000000;
-    const int N = 2000;    // leaves; m = M/N = 2000
+    const int N = 2000;
 
     const int ds[] = {4, 16, 64};
     const int ks[] = {16, 64};
 
-    printf("Table 8 reproduction — FIKNN_gpu_dense (Row-Partitioned)\n");
+    printf("Table 8 reproduction — dfi_leafknn (GPU-side sort precomputation)\n");
     printf("M=%d  N=%d leaves  m=%d per leaf\n\n", M, N, M / N);
     printf("%-10s %6s %14s\n", "Dataset", "k", "Total (s)");
     printf("%-10s %6s %14s\n", "-------", "-", "---------");
