@@ -14,7 +14,6 @@ args = parser.parse_args()
 M  = 4_000_000
 N  = 2_000    # leaves
 m  = M // N   # 2000 pts per leaf
-b  = 32
 ds = [4, 16, 64]
 ks = [16, 64]
 
@@ -63,6 +62,7 @@ print(f"{'-------':>10}  {'–':>6}  {'---------':>12}")
 
 for d in ds:
     for k in ks:
+        b    = max(32, k)
         np.random.seed(42)
         X_np = np.random.randn(N, m, d).astype(np.float64)
         X    = torch.from_numpy(X_np)
