@@ -64,15 +64,16 @@ print(f"{'-------':>10}  {'–':>6}  {'---------':>12}")
 
 for d in ds:
     for k in ks:
+        b    = max(32, k)
         np.random.seed(42)
         X_np = np.random.randn(N, m, d).astype(np.float64)
         X    = torch.from_numpy(X_np)
         Xn   = torch.empty((N, m), dtype=torch.float64)
         Dloc = torch.zeros((N, m, b), dtype=torch.float64)
-        Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
-        Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+        Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
+        Gdst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
+        Lidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
+        Ldst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
 
         for i in range(3):
             t0 = time.time()
