@@ -75,9 +75,15 @@ for d in ds:
         Lidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
         Ldst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
 
+        if args.pipeline == "fused" and k == b:
+            from knn_kokkos_keqb import run_knn_pipeline_keqb
+            _call = lambda: run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+        else:
+            _call = lambda: run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+
         for i in range(3):
             t0 = time.time()
-            run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+            _call()
             t1 = time.time()
 
         elapsed_s = t1 - t0

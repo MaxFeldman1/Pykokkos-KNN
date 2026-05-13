@@ -30,7 +30,7 @@ if __name__ == '__main__':
 
 
 # -----------------------------
-# kernel: k < b
+# fused pipeline kernel
 # -----------------------------
 @pk.workunit
 def knn_pipeline_kernel(team_member: pk.TeamMember,
@@ -79,7 +79,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
         pk.parallel_for(pk.TeamThreadRange(team_member, n_pairs), dblk_body)
         team_member.team_barrier()
 
-    # ---- Phase 3: topk within diagonal blocks ----
+    # ---- Phase 3: topk within diagonal blocks into Ldst[0..k-1] ----
     def topk_dblk_body(i: int):
         im: pk.int32 = i % b
         id_: pk.int32 = i - im
@@ -106,7 +106,9 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
     pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
     team_member.team_barrier()
 
-    # ---- Phase 4: bitonic merge — diagonal ----
+    # ---- Phase 4: collaborative bitonic merge — diagonal ----
+    # Rows processed serially; each sort stage is parallel across team threads.
+    # Sbuf is (N, 2k): one shared scratch slot per dataset, reused each row.
     row_d: pk.int32 = 0
     for row_d in range(m):
         def load_diag(p: int):
@@ -122,18 +124,18 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             h_d: pk.int32 = g_d >> 1
             while h_d >= 1:
                 def sort_diag(j_s: int):
-                    ixj_d: pk.int32    = j_s ^ h_d
+                    ixj_d: pk.int32   = j_s ^ h_d
                     do_cmp_d: pk.int32 = ixj_d > j_s
-                    asc_d: pk.int32    = (j_s & g_d) == 0
+                    asc_d: pk.int32   = (j_s & g_d) == 0
                     d_j_d:   pk.float64 = Sbuf_d[n][j_s]
                     d_ixj_d: pk.float64 = Sbuf_d[n][ixj_d]
                     ns_d: pk.int32 = do_cmp_d * (asc_d * (d_j_d > d_ixj_d) + (1 - asc_d) * (d_j_d < d_ixj_d))
                     tmp_d_d: pk.float64 = d_j_d
                     tmp_i_d: pk.int32   = Sbuf_i[n][j_s]
-                    Sbuf_d[n][j_s]   = d_j_d   * (1 - ns_d) + d_ixj_d           * ns_d
-                    Sbuf_i[n][j_s]   = tmp_i_d * (1 - ns_d) + Sbuf_i[n][ixj_d]  * ns_d
-                    Sbuf_d[n][ixj_d] = d_ixj_d * (1 - ns_d) + tmp_d_d           * ns_d
-                    Sbuf_i[n][ixj_d] = Sbuf_i[n][ixj_d] * (1 - ns_d) + tmp_i_d * ns_d
+                    Sbuf_d[n][j_s]    = d_j_d   * (1 - ns_d) + d_ixj_d            * ns_d
+                    Sbuf_i[n][j_s]    = tmp_i_d * (1 - ns_d) + Sbuf_i[n][ixj_d]   * ns_d
+                    Sbuf_d[n][ixj_d]  = d_ixj_d * (1 - ns_d) + tmp_d_d            * ns_d
+                    Sbuf_i[n][ixj_d]  = Sbuf_i[n][ixj_d] * (1 - ns_d) + tmp_i_d  * ns_d
                 pk.parallel_for(pk.TeamThreadRange(team_member, n2k), sort_diag)
                 team_member.team_barrier()
                 h_d = h_d >> 1
@@ -145,7 +147,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
         pk.parallel_for(pk.TeamThreadRange(team_member, k), store_diag)
         team_member.team_barrier()
 
-    # ---- flush ----
+    # ---- flush Ldst / Lidx (k slots) and Dloc ----
     def flush_local(lin: int):
         row: pk.int32 = lin // k
         col: pk.int32 = lin % k
@@ -269,15 +271,11 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
 
 def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     """
-    Gdst, Gidx : (N, m, k) — k-best neighbors per point (ascending after merge).
-    Ldst, Lidx : (N, m, k) — local block candidates.
+    X, Xn, Dloc  : unchanged shape
+    Gdst, Gidx   : (N, m, k)   — k-best neighbors per point (ascending after merge)
+    Ldst, Lidx   : (N, m, k)   — local block candidates
     k must be a power of 2.
-    Uses the k=b optimised kernel (separate module) when k == b.
     """
-    if k == b:
-        from knn_kokkos_keqb import run_knn_pipeline_keqb
-        run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
-        return
     Sbuf_d = torch.empty((N, 2 * k), dtype=torch.float64)
     Sbuf_i = torch.empty((N, 2 * k), dtype=torch.int32)
     pk.parallel_for(
