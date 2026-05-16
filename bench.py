@@ -28,13 +28,11 @@ print(f"Benchmarking: {args.pipeline}")
 # cpp path: compile + subprocess
 # -----------------------------
 if args.pipeline == "cpp":
-    binary = os.path.join(os.path.dirname(__file__), "cpp_bench")
-    src    = os.path.join(os.path.dirname(__file__), "cpp_bench.cu")
-    fiknn  = os.path.join(os.path.dirname(__file__), "../pyrknn/GeMM/src/FIKNN_dense.cu")
-    inc    = os.path.join(os.path.dirname(__file__), "../pyrknn/GeMM/include")
-
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("TACC_CUDA_DIR") or "/usr/local/cuda"
-    helper_inc = os.path.join(cuda_home, "samples/common/inc")
+    knn_dir = os.path.dirname(os.path.abspath(__file__))
+    binary  = os.path.join(knn_dir, "cpp_bench")
+    src     = os.path.join(knn_dir, "cpp_bench.cu")
+    fiknn   = os.path.join(knn_dir, "../pyrknn/GeMM/pysrc/filknn/dense/dfiknn_test.cu")
+    inc     = os.path.join(knn_dir, "../pyrknn/GeMM/pysrc/filknn/dense")
 
     needs_build = (
         not os.path.exists(binary)
@@ -42,13 +40,12 @@ if args.pipeline == "cpp":
         or os.path.getmtime(fiknn) > os.path.getmtime(binary)
     )
     if needs_build:
-        knn_dir = os.path.dirname(os.path.abspath(src))
         compile_cmd = [
             "nvcc",
-            f"-I{knn_dir}",     # our helper_cuda.h stub takes priority
-            f"-I{helper_inc}", f"-I{inc}",
+            f"-I{knn_dir}", f"-I{inc}",
+            "-gencode", "arch=compute_90,code=sm_90",
             fiknn, src,
-            "-O2", "-o", binary,
+            "-O2", "-lcublas", "-o", binary,
         ]
         print("Compiling cpp_bench:", " ".join(compile_cmd))
         result = subprocess.run(compile_cmd)
