@@ -8,7 +8,7 @@ import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("pipeline", nargs="?", default="knn_kokkos",
-                    choices=["knn_kokkos", "unfused_knn_kokkos", "gemm_knn_kokkos", "cpp"],
+                    choices=["knn_kokkos", "knn_kokkos_keqb", "unfused_knn_kokkos", "gemm_knn_kokkos", "cpp"],
                     help="Which pipeline to benchmark")
 args = parser.parse_args()
 
@@ -81,6 +81,9 @@ if args.pipeline == "unfused_knn_kokkos":
     from unfused_knn_kokkos import run_knn_pipeline
 elif args.pipeline == "gemm_knn_kokkos":
     from gemm_knn_kokkos import run_knn_pipeline
+elif args.pipeline == "knn_kokkos_keqb":
+    from knn_kokkos_keqb import run_knn_pipeline_keqb as run_knn_pipeline
+    b = k  # keqb kernel requires k == b
 else:
     from knn_kokkos import run_knn_pipeline
 
