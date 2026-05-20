@@ -148,22 +148,51 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
         pk.parallel_for(pk.TeamThreadRange(team_member, blksize_h), hblk_col_body)
         team_member.team_barrier()
 
-        # Row side: insert blksize_h candidates into upper half via worst-scan.
+        # Row side: insert blksize_h candidates into upper half via max-heap (O(log k)).
+        # Upper half Gdst[n][i_r][k..2k-1] is a max-heap; root = current maximum.
         def topk_row_body(im_r: int):
             i_r: pk.int32 = im_r + b * (hblk_i - 1)
+            neginf: pk.float64 = -1.7976931348623157e+308
             jm_r: pk.int32 = 0
             for jm_r in range(blksize_h):
                 j_r: pk.int32 = jm_r + b * hblk_i
                 val_r: pk.float64 = Dloc[n][jm_r][im_r]
-                worst_r: pk.int32 = 0
-                t_r: pk.int32 = 0
-                prop_r: pk.int32 = 0
-                for t_r in range(1, k):
-                    prop_r = Gdst[n][i_r][k + t_r] > Gdst[n][i_r][k + worst_r]
-                    worst_r = t_r * prop_r + worst_r * (1 - prop_r)
-                prop_r = val_r < Gdst[n][i_r][k + worst_r]
-                Gdst[n][i_r][k + worst_r] = val_r * prop_r + Gdst[n][i_r][k + worst_r] * (1 - prop_r)
-                Gidx[n][i_r][k + worst_r] = j_r  * prop_r + Gidx[n][i_r][k + worst_r] * (1 - prop_r)
+
+                # Replace root if candidate beats current max
+                do_insert: pk.int32 = val_r < Gdst[n][i_r][k]
+                Gdst[n][i_r][k] = val_r * do_insert + Gdst[n][i_r][k] * (1 - do_insert)
+                Gidx[n][i_r][k] = j_r   * do_insert + Gidx[n][i_r][k] * (1 - do_insert)
+
+                # Sift down: 6 fixed iterations covers k ≤ 64
+                t_h: pk.int32 = 0
+                step_s: pk.int32 = 0
+                for step_s in range(6):
+                    lc_s: pk.int32    = 2 * t_h + 1
+                    rc_s: pk.int32    = 2 * t_h + 2
+                    lc_v: pk.int32    = lc_s < k
+                    rc_v: pk.int32    = rc_s < k
+                    lc_idx: pk.int32  = lc_s * lc_v + (k - 1) * (1 - lc_v)
+                    rc_idx: pk.int32  = rc_s * rc_v + (k - 1) * (1 - rc_v)
+                    lc_d: pk.float64  = Gdst[n][i_r][k + lc_idx]
+                    rc_d: pk.float64  = Gdst[n][i_r][k + rc_idx]
+                    lc_m: pk.float64  = lc_d * lc_v + neginf * (1 - lc_v)
+                    rc_m: pk.float64  = rc_d * rc_v + neginf * (1 - rc_v)
+                    r_wins: pk.int32  = rc_m > lc_m
+                    best_c: pk.int32  = rc_s * r_wins + lc_s * (1 - r_wins)
+                    best_v: pk.int32  = rc_v * r_wins + lc_v * (1 - r_wins)
+                    best_d: pk.float64 = rc_m * r_wins + lc_m * (1 - r_wins)
+                    do_swap: pk.int32 = (best_d > Gdst[n][i_r][k + t_h]) * best_v * do_insert
+                    # Safe write index: clamp to t_h when best_v=0 (do_swap=0, so write is no-op)
+                    best_cs: pk.int32   = best_c * best_v + t_h * (1 - best_v)
+                    par_d: pk.float64   = Gdst[n][i_r][k + t_h]
+                    par_i: pk.int32     = Gidx[n][i_r][k + t_h]
+                    child_d: pk.float64 = Gdst[n][i_r][k + best_cs]
+                    child_i: pk.int32   = Gidx[n][i_r][k + best_cs]
+                    Gdst[n][i_r][k + t_h]     = par_d   * (1 - do_swap) + child_d * do_swap
+                    Gidx[n][i_r][k + t_h]     = par_i   * (1 - do_swap) + child_i * do_swap
+                    Gdst[n][i_r][k + best_cs]  = child_d * (1 - do_swap) + par_d   * do_swap
+                    Gidx[n][i_r][k + best_cs]  = child_i * (1 - do_swap) + par_i   * do_swap
+                    t_h = best_c * do_swap + t_h * (1 - do_swap)
 
         pk.parallel_for(pk.TeamThreadRange(team_member, b), topk_row_body)
         team_member.team_barrier()

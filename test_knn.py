@@ -3,7 +3,8 @@ import numpy as np
 import torch
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--unfused", action="store_true")
+parser.add_argument("--pipeline", default="knn_kokkos",
+                    choices=["knn_kokkos", "knn_kokkos_keqb", "unfused_knn_kokkos"])
 args = parser.parse_args()
 
 # -----------------------------
@@ -35,25 +36,42 @@ def knn_brute(X_np, k):
 gt_idx = knn_brute(X_np, k)
 
 # -----------------------------
-# helpers
+# imports
 # -----------------------------
-if args.unfused:
+if args.pipeline == "knn_kokkos_keqb":
+    from knn_kokkos_keqb import run_knn_pipeline_keqb
+elif args.pipeline == "unfused_knn_kokkos":
     from unfused_knn_kokkos import run_knn_pipeline
 else:
     from knn_kokkos import run_knn_pipeline
 
-def fresh_tensors(N, m, b, k):
+# -----------------------------
+# helpers
+# -----------------------------
+def fresh_tensors_std(N, m, b, k):
+    """Standard pipeline: Gdst/Gidx/Ldst/Lidx all (N, m, k)."""
     X    = torch.from_numpy(X_np.copy())
     Xn   = torch.empty((N, m), dtype=torch.float64)
     Dloc = torch.zeros((N, m, b), dtype=torch.float64)
-    Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
     Gdst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
-    Lidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
+    Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
     Ldst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
-    return X, Xn, Dloc, Gidx, Gdst, Lidx, Ldst
+    Lidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
+    return X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx
+
+def fresh_tensors_keqb(N, m, b, k):
+    """keqb pipeline: Gdst/Gidx (N, m, 2k), no Ldst/Lidx."""
+    X    = torch.from_numpy(X_np.copy())
+    Xn   = torch.empty((N, m), dtype=torch.float64)
+    Dloc = torch.zeros((N, m, b), dtype=torch.float64)
+    Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Gidx = torch.full((N, m, 2 * k), -1,                             dtype=torch.int32)
+    return X, Xn, Dloc, Gdst, Gidx
 
 def extract_knn(Gidx, Gdst, N, m, k):
-    Gidx_np = Gidx.numpy().astype(np.int32)   # (N, m, k)
+    # Works for both standard (size k) and keqb (size 2k): argsort puts real
+    # distances first; idx >= 0 filter skips the INF/-1 upper slots.
+    Gidx_np = Gidx.numpy().astype(np.int32)
     Gdst_np = Gdst.numpy()
     result = np.full((N, m, k), -1, dtype=np.int32)
     for n in range(N):
@@ -93,9 +111,17 @@ def compare(pred, gt, X_np, N, m, k, label):
 # -----------------------------
 # run
 # -----------------------------
-X, Xn, Dloc, Gidx, Gdst, Lidx, Ldst = fresh_tensors(N, m, b, k)
-run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
-pred = extract_knn(Gidx, Gdst, N, m, k)
-
-print(f"N={N}  m={m}  d={d}  k={k}  b={b}")
-compare(pred, gt_idx, X_np, N, m, k, "batched")
+if args.pipeline == "knn_kokkos_keqb":
+    print(f"N={N}  m={m}  d={d}")
+    for kk in [4, 8, 16, 32]:
+        gt = knn_brute(X_np, kk)
+        X, Xn, Dloc, Gdst, Gidx = fresh_tensors_keqb(N, m, kk, kk)
+        run_knn_pipeline_keqb(N, m, d, kk, kk, X, Xn, Dloc, Gdst, Gidx)
+        pred = extract_knn(Gidx, Gdst, N, m, kk)
+        compare(pred, gt, X_np, N, m, kk, f"keqb k=b={kk}")
+else:
+    X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx = fresh_tensors_std(N, m, b, k)
+    run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+    pred = extract_knn(Gidx, Gdst, N, m, k)
+    print(f"N={N}  m={m}  d={d}  k={k}  b={b}")
+    compare(pred, gt_idx, X_np, N, m, k, "batched")
