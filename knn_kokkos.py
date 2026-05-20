@@ -32,7 +32,10 @@ if __name__ == '__main__':
 # -----------------------------
 # fused pipeline kernel
 # -----------------------------
-@pk.workunit
+@pk.workunit(scratch=[
+    (pk.float64, lambda p: 2 * p.k),
+    (pk.int32,   lambda p: 2 * p.k),
+])
 def knn_pipeline_kernel(team_member: pk.TeamMember,
                         X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx,
                         m, d, k, b):
@@ -279,9 +282,7 @@ def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     Ldst, Lidx : (N, m, k)   — local block candidates
     k must be a power of 2.
     """
-    scratch_size = (pk.ScratchView1D[pk.float64].shmem_size(2 * k) +
-                    pk.ScratchView1D[pk.int32].shmem_size(2 * k))
-    policy = pk.TeamPolicy(N, pk.AUTO).set_scratch_size(0, pk.PerTeam(scratch_size))
+    policy = pk.TeamPolicy(N, pk.AUTO)
     pk.parallel_for(
         "MAIN_PIPELINE",
         policy,
