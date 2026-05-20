@@ -58,6 +58,9 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
         team_member.team_barrier()
 
     # ---- Phase 3: topk within diagonal blocks ----
+    # k=b: each point has at most b-1 = k-1 candidates in its block, so all fit
+    # in the k slots — no worst-scan needed. Direct slot assignment: slot = jm
+    # if jm < im, slot = jm-1 if jm > im (self is skipped branchlessly).
     def topk_dblk_body(i: int):
         im: pk.int32 = i % b
         id_: pk.int32 = i - im
@@ -66,20 +69,14 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
         j: pk.int32 = 0
         for j in range(id_, top_range):
             jm: pk.int32 = j % b
+            not_self: pk.int32 = j != i
             i_first: pk.int32 = im <= jm
             idx0: pk.int32 = i * i_first + j * (1 - i_first)
             idx1: pk.int32 = jm * i_first + im * (1 - i_first)
             val: pk.float64 = Dloc[n][idx0][idx1]
-            not_self: pk.int32 = j != i
-            worst: pk.int32 = 0
-            t: pk.int32 = 0
-            prop: pk.int32 = 0
-            for t in range(1, k):
-                prop = Ldst[n][i][t] > Ldst[n][i][worst]
-                worst = t * prop + worst * (1 - prop)
-            prop = not_self * (val < Ldst[n][i][worst])
-            Ldst[n][i][worst] = val * prop + Ldst[n][i][worst] * (1 - prop)
-            Lidx[n][i][worst] = j * prop + Lidx[n][i][worst] * (1 - prop)
+            slot: pk.int32 = jm - (jm > im)
+            Ldst[n][i][slot] = val * not_self + Ldst[n][i][slot] * (1 - not_self)
+            Lidx[n][i][slot] = j   * not_self + Lidx[n][i][slot] * (1 - not_self)
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
     team_member.team_barrier()
