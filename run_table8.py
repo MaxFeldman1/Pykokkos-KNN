@@ -69,15 +69,17 @@ for d in ds:
         X    = torch.from_numpy(X_np)
         Xn   = torch.empty((N, m), dtype=torch.float64)
         Dloc = torch.zeros((N, m, b), dtype=torch.float64)
-        Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
-        Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
 
         if args.pipeline == "fused" and k == b:
             from knn_kokkos_keqb import run_knn_pipeline_keqb
-            _call = lambda: run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+            Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float64).max, dtype=torch.float64)
+            Gidx = torch.full((N, m, 2 * k), -1,                             dtype=torch.int32)
+            _call = lambda: run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx)
         else:
+            Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+            Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
+            Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+            Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
             _call = lambda: run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
 
         for i in range(3):

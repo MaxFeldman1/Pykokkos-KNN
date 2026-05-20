@@ -1,15 +1,17 @@
 import pykokkos as pk
 import torch
 
-# k = b kernel: O(k) worst-find scan removed from hblk_col_body.
-# Valid only when k == b. Ldst is flushed to INF before each hblk iteration
-# and exactly b = k distances are inserted, so im_h is the direct slot index.
+# k = b kernel: Ldst/Lidx eliminated — Gdst/Gidx sized 2k.
+# Upper half Gdst[k..2k-1] / Gidx[k..2k-1] serves as the local candidate buffer.
+# After each bitonic merge, store writes winners to [0..k-1] and resets [k..2k-1]
+# to INF/-1 in the same pass, eliminating all separate flush kernels.
+# Valid only when k == b.
 @pk.workunit(scratch=[
     (pk.float64, lambda p: 2 * p.k),
     (pk.int32,   lambda p: 2 * p.k),
 ])
 def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
-                              X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx,
+                              X, Xn, Dloc, Gdst, Gidx,
                               m, d, k, b):
     INF: pk.float64 = 1.7976931348623157e+308
     n: pk.int32 = team_member.league_rank()
@@ -58,9 +60,8 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
         team_member.team_barrier()
 
     # ---- Phase 3: topk within diagonal blocks ----
-    # k=b: each point has at most b-1 = k-1 candidates in its block, so all fit
-    # in the k slots — no worst-scan needed. Direct slot assignment: slot = jm
-    # if jm < im, slot = jm-1 if jm > im (self is skipped branchlessly).
+    # k=b: each point has at most b-1 = k-1 candidates, all fit in upper k slots.
+    # Direct slot: jm < im -> slot=jm, jm > im -> slot=jm-1 (skip self branchlessly).
     def topk_dblk_body(i: int):
         im: pk.int32 = i % b
         id_: pk.int32 = i - im
@@ -75,8 +76,8 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
             idx1: pk.int32 = jm * i_first + im * (1 - i_first)
             val: pk.float64 = Dloc[n][idx0][idx1]
             slot: pk.int32 = jm - (jm > im)
-            Ldst[n][i][slot] = val * not_self + Ldst[n][i][slot] * (1 - not_self)
-            Lidx[n][i][slot] = j   * not_self + Lidx[n][i][slot] * (1 - not_self)
+            Gdst[n][i][k + slot] = val * not_self + Gdst[n][i][k + slot] * (1 - not_self)
+            Gidx[n][i][k + slot] = j   * not_self + Gidx[n][i][k + slot] * (1 - not_self)
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
     team_member.team_barrier()
@@ -87,8 +88,8 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
         def load_diag(p: int):
             Sbuf_d[p]     = Gdst[n][row_d][p]
             Sbuf_i[p]     = Gidx[n][row_d][p]
-            Sbuf_d[p + k] = Ldst[n][row_d][p]
-            Sbuf_i[p + k] = Lidx[n][row_d][p]
+            Sbuf_d[p + k] = Gdst[n][row_d][p + k]
+            Sbuf_i[p + k] = Gidx[n][row_d][p + k]
         pk.parallel_for(pk.TeamThreadRange(team_member, k), load_diag)
         team_member.team_barrier()
 
@@ -106,41 +107,30 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
                     tmp_d_d: pk.float64 = d_j_d
                     tmp_i_d: pk.int32   = Sbuf_i[j_s]
                     Sbuf_d[j_s]   = d_j_d   * (1 - ns_d) + d_ixj_d           * ns_d
-                    Sbuf_i[j_s]   = tmp_i_d * (1 - ns_d) + Sbuf_i[ixj_d]  * ns_d
-                    Sbuf_d[ixj_d] = d_ixj_d * (1 - ns_d) + tmp_d_d           * ns_d
-                    Sbuf_i[ixj_d] = Sbuf_i[ixj_d] * (1 - ns_d) + tmp_i_d * ns_d
+                    Sbuf_i[j_s]   = tmp_i_d * (1 - ns_d) + Sbuf_i[ixj_d]     * ns_d
+                    Sbuf_d[ixj_d] = d_ixj_d * (1 - ns_d) + tmp_d_d            * ns_d
+                    Sbuf_i[ixj_d] = Sbuf_i[ixj_d] * (1 - ns_d) + tmp_i_d     * ns_d
                 pk.parallel_for(pk.TeamThreadRange(team_member, n2k), sort_diag)
                 team_member.team_barrier()
                 h_d = h_d >> 1
             g_d = g_d * 2
 
+        # Write winners to lower half; reset upper half to INF/-1 in same pass.
         def store_diag(p: int):
-            Gdst[n][row_d][p] = Sbuf_d[p]
-            Gidx[n][row_d][p] = Sbuf_i[p]
+            Gdst[n][row_d][p]     = Sbuf_d[p]
+            Gidx[n][row_d][p]     = Sbuf_i[p]
+            Gdst[n][row_d][p + k] = INF
+            Gidx[n][row_d][p + k] = -1
         pk.parallel_for(pk.TeamThreadRange(team_member, k), store_diag)
         team_member.team_barrier()
-
-    # ---- flush ----
-    def flush_local(lin: int):
-        row: pk.int32 = lin // k
-        col: pk.int32 = lin % k
-        Ldst[n][row][col] = INF
-        Lidx[n][row][col] = -1
-
-    def flush_dloc(lin: int):
-        row: pk.int32 = lin // b
-        col: pk.int32 = lin % b
-        Dloc[n][row][col] = -1.0
-
-    pk.parallel_for(pk.TeamThreadRange(team_member, m * k), flush_local)
-    pk.parallel_for(pk.TeamThreadRange(team_member, m * b), flush_dloc)
-    team_member.team_barrier()
 
     # ---- Phase 5-7: off-diagonal (hblk) loop ----
     hblk_i: pk.int32 = 0
     for hblk_i in range(1, l):
         blksize_h: pk.int32 = m - b * hblk_i
 
+        # Compute distances for current hblk column strip; write directly to
+        # upper half of Gdst/Gidx (column/j side, k=b slots, direct indexing).
         def hblk_col_body(jm: int):
             j: pk.int32 = jm + b * hblk_i
             im_h: pk.int32 = 0
@@ -152,12 +142,13 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
                     dot += X[n][i_h][t] * X[n][j][t]
                 val: pk.float64 = -2.0 * dot + Xn[n][i_h] + Xn[n][j]
                 Dloc[n][jm][im_h] = val
-                Ldst[n][j][im_h] = val
-                Lidx[n][j][im_h] = i_h
+                Gdst[n][j][k + im_h] = val
+                Gidx[n][j][k + im_h] = i_h
 
         pk.parallel_for(pk.TeamThreadRange(team_member, blksize_h), hblk_col_body)
         team_member.team_barrier()
 
+        # Row side: insert blksize_h candidates into upper half via worst-scan.
         def topk_row_body(im_r: int):
             i_r: pk.int32 = im_r + b * (hblk_i - 1)
             jm_r: pk.int32 = 0
@@ -168,11 +159,11 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
                 t_r: pk.int32 = 0
                 prop_r: pk.int32 = 0
                 for t_r in range(1, k):
-                    prop_r = Ldst[n][i_r][t_r] > Ldst[n][i_r][worst_r]
+                    prop_r = Gdst[n][i_r][k + t_r] > Gdst[n][i_r][k + worst_r]
                     worst_r = t_r * prop_r + worst_r * (1 - prop_r)
-                prop_r = val_r < Ldst[n][i_r][worst_r]
-                Ldst[n][i_r][worst_r] = val_r * prop_r + Ldst[n][i_r][worst_r] * (1 - prop_r)
-                Lidx[n][i_r][worst_r] = j_r * prop_r + Lidx[n][i_r][worst_r] * (1 - prop_r)
+                prop_r = val_r < Gdst[n][i_r][k + worst_r]
+                Gdst[n][i_r][k + worst_r] = val_r * prop_r + Gdst[n][i_r][k + worst_r] * (1 - prop_r)
+                Gidx[n][i_r][k + worst_r] = j_r  * prop_r + Gidx[n][i_r][k + worst_r] * (1 - prop_r)
 
         pk.parallel_for(pk.TeamThreadRange(team_member, b), topk_row_body)
         team_member.team_barrier()
@@ -186,8 +177,8 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
             def load_hblk(p: int):
                 Sbuf_d[p]     = Gdst[n][i_mh][p]
                 Sbuf_i[p]     = Gidx[n][i_mh][p]
-                Sbuf_d[p + k] = Ldst[n][i_mh][p]
-                Sbuf_i[p + k] = Lidx[n][i_mh][p]
+                Sbuf_d[p + k] = Gdst[n][i_mh][p + k]
+                Sbuf_i[p + k] = Gidx[n][i_mh][p + k]
             pk.parallel_for(pk.TeamThreadRange(team_member, k), load_hblk)
             team_member.team_barrier()
 
@@ -205,44 +196,30 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
                         tmp_d_h: pk.float64 = d_j_h
                         tmp_i_h: pk.int32   = Sbuf_i[j_s]
                         Sbuf_d[j_s]   = d_j_h   * (1 - ns_h) + d_ixj_h           * ns_h
-                        Sbuf_i[j_s]   = tmp_i_h * (1 - ns_h) + Sbuf_i[ixj_h]  * ns_h
-                        Sbuf_d[ixj_h] = d_ixj_h * (1 - ns_h) + tmp_d_h           * ns_h
-                        Sbuf_i[ixj_h] = Sbuf_i[ixj_h] * (1 - ns_h) + tmp_i_h * ns_h
+                        Sbuf_i[j_s]   = tmp_i_h * (1 - ns_h) + Sbuf_i[ixj_h]     * ns_h
+                        Sbuf_d[ixj_h] = d_ixj_h * (1 - ns_h) + tmp_d_h            * ns_h
+                        Sbuf_i[ixj_h] = Sbuf_i[ixj_h] * (1 - ns_h) + tmp_i_h     * ns_h
                     pk.parallel_for(pk.TeamThreadRange(team_member, n2k), sort_hblk)
                     team_member.team_barrier()
                     h_h = h_h >> 1
                 g_h = g_h * 2
 
             def store_hblk(p: int):
-                Gdst[n][i_mh][p] = Sbuf_d[p]
-                Gidx[n][i_mh][p] = Sbuf_i[p]
+                Gdst[n][i_mh][p]     = Sbuf_d[p]
+                Gidx[n][i_mh][p]     = Sbuf_i[p]
+                Gdst[n][i_mh][p + k] = INF
+                Gidx[n][i_mh][p + k] = -1
             pk.parallel_for(pk.TeamThreadRange(team_member, k), store_hblk)
             team_member.team_barrier()
 
-        def flush_local_h(lin: int):
-            row: pk.int32 = lin // k
-            col: pk.int32 = lin % k
-            Ldst[n][row][col] = INF
-            Lidx[n][row][col] = -1
 
-        def flush_dloc_h(lin: int):
-            row: pk.int32 = lin // b
-            col: pk.int32 = lin % b
-            Dloc[n][row][col] = -1.0
-
-        pk.parallel_for(pk.TeamThreadRange(team_member, m * k), flush_local_h)
-        pk.parallel_for(pk.TeamThreadRange(team_member, m * b), flush_dloc_h)
-        team_member.team_barrier()
-
-
-def run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
+def run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx):
     policy = pk.TeamPolicy(N, pk.AUTO)
     pk.parallel_for(
         "MAIN_PIPELINE_KEQB",
         policy,
         knn_pipeline_kernel_keqb,
         X=X, Xn=Xn, Dloc=Dloc, Gdst=Gdst, Gidx=Gidx,
-        Ldst=Ldst, Lidx=Lidx,
         m=m, d=d, k=k, b=b
     )
     pk.fence()
