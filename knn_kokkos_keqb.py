@@ -124,13 +124,15 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
         pk.parallel_for(pk.TeamThreadRange(team_member, k), store_diag)
         team_member.team_barrier()
 
-    # ---- Phase 5-7: off-diagonal (hblk) loop ----
+    # ---- Phase 5-7: off-diagonal (hblk) loop — batch-bitonic ----
+    # No per-candidate insertion (no scan, no heap). Mirrors the C++ approach:
+    # candidates are loaded wholesale in chunks of b and merged via bitonic sort.
     hblk_i: pk.int32 = 0
     for hblk_i in range(1, l):
         blksize_h: pk.int32 = m - b * hblk_i
+        i_off_h: pk.int32 = b * (hblk_i - 1)
 
-        # Compute distances for current hblk column strip; write directly to
-        # upper half of Gdst/Gidx (column/j side, k=b slots, direct indexing).
+        # Compute distances for current strip; store in Dloc + fill j-side upper half.
         def hblk_col_body(jm: int):
             j: pk.int32 = jm + b * hblk_i
             im_h: pk.int32 = 0
@@ -148,97 +150,105 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
         pk.parallel_for(pk.TeamThreadRange(team_member, blksize_h), hblk_col_body)
         team_member.team_barrier()
 
-        # Row side: insert blksize_h candidates into upper half via max-heap (O(log k)).
-        # Upper half Gdst[n][i_r][k..2k-1] is a max-heap; root = current maximum.
-        def topk_row_body(im_r: int):
-            i_r: pk.int32 = im_r + b * (hblk_i - 1)
-            neginf: pk.float64 = -1.7976931348623157e+308
-            jm_r: pk.int32 = 0
-            for jm_r in range(blksize_h):
-                j_r: pk.int32 = jm_r + b * hblk_i
-                val_r: pk.float64 = Dloc[n][jm_r][im_r]
+        # I-side: sub-chunks of b candidates — fill upper half then bitonic merge.
+        n_sub_h: pk.int32 = (blksize_h + b - 1) // b
+        sub_idx_h: pk.int32 = 0
+        for sub_idx_h in range(n_sub_h):
+            sub_off_h: pk.int32 = sub_idx_h * b
+            sub_end_h: pk.int32 = sub_off_h + b
+            m_sub_h: pk.int32   = sub_end_h > blksize_h
+            sub_sz_h: pk.int32  = b - m_sub_h * (sub_end_h - blksize_h)
 
-                # Replace root if candidate beats current max
-                do_insert: pk.int32 = val_r < Gdst[n][i_r][k]
-                Gdst[n][i_r][k] = val_r * do_insert + Gdst[n][i_r][k] * (1 - do_insert)
-                Gidx[n][i_r][k] = j_r   * do_insert + Gidx[n][i_r][k] * (1 - do_insert)
-
-                # Sift down: 6 fixed iterations covers k ≤ 64
-                t_h: pk.int32 = 0
-                step_s: pk.int32 = 0
-                for step_s in range(6):
-                    lc_s: pk.int32    = 2 * t_h + 1
-                    rc_s: pk.int32    = 2 * t_h + 2
-                    lc_v: pk.int32    = lc_s < k
-                    rc_v: pk.int32    = rc_s < k
-                    lc_idx: pk.int32  = lc_s * lc_v + (k - 1) * (1 - lc_v)
-                    rc_idx: pk.int32  = rc_s * rc_v + (k - 1) * (1 - rc_v)
-                    lc_d: pk.float64  = Gdst[n][i_r][k + lc_idx]
-                    rc_d: pk.float64  = Gdst[n][i_r][k + rc_idx]
-                    lc_m: pk.float64  = lc_d * lc_v + neginf * (1 - lc_v)
-                    rc_m: pk.float64  = rc_d * rc_v + neginf * (1 - rc_v)
-                    r_wins: pk.int32  = rc_m > lc_m
-                    best_c: pk.int32  = rc_s * r_wins + lc_s * (1 - r_wins)
-                    best_v: pk.int32  = rc_v * r_wins + lc_v * (1 - r_wins)
-                    best_d: pk.float64 = rc_m * r_wins + lc_m * (1 - r_wins)
-                    do_swap: pk.int32 = (best_d > Gdst[n][i_r][k + t_h]) * best_v * do_insert
-                    # Safe write index: clamp to t_h when best_v=0 (do_swap=0, so write is no-op)
-                    best_cs: pk.int32   = best_c * best_v + t_h * (1 - best_v)
-                    par_d: pk.float64   = Gdst[n][i_r][k + t_h]
-                    par_i: pk.int32     = Gidx[n][i_r][k + t_h]
-                    child_d: pk.float64 = Gdst[n][i_r][k + best_cs]
-                    child_i: pk.int32   = Gidx[n][i_r][k + best_cs]
-                    Gdst[n][i_r][k + t_h]     = par_d   * (1 - do_swap) + child_d * do_swap
-                    Gidx[n][i_r][k + t_h]     = par_i   * (1 - do_swap) + child_i * do_swap
-                    Gdst[n][i_r][k + best_cs]  = child_d * (1 - do_swap) + par_d   * do_swap
-                    Gidx[n][i_r][k + best_cs]  = child_i * (1 - do_swap) + par_i   * do_swap
-                    t_h = best_c * do_swap + t_h * (1 - do_swap)
-
-        pk.parallel_for(pk.TeamThreadRange(team_member, b), topk_row_body)
-        team_member.team_barrier()
-
-        merge_count: pk.int32 = m - b * (hblk_i - 1)
-        merge_off: pk.int32 = b * (hblk_i - 1)
-
-        row_h: pk.int32 = 0
-        for row_h in range(merge_count):
-            i_mh: pk.int32 = row_h + merge_off
-            def load_hblk(p: int):
-                Sbuf_d[p]     = Gdst[n][i_mh][p]
-                Sbuf_i[p]     = Gidx[n][i_mh][p]
-                Sbuf_d[p + k] = Gdst[n][i_mh][p + k]
-                Sbuf_i[p + k] = Gidx[n][i_mh][p + k]
-            pk.parallel_for(pk.TeamThreadRange(team_member, k), load_hblk)
+            def fill_irows(im_r: int):
+                i_r_f: pk.int32 = im_r + i_off_h
+                slot_f: pk.int32 = 0
+                for slot_f in range(sub_sz_h):
+                    Gdst[n][i_r_f][k + slot_f] = Dloc[n][sub_off_h + slot_f][im_r]
+                    Gidx[n][i_r_f][k + slot_f] = sub_off_h + slot_f + b * hblk_i
+            pk.parallel_for(pk.TeamThreadRange(team_member, b), fill_irows)
             team_member.team_barrier()
 
-            g_h: pk.int32 = 2
-            while g_h <= n2k:
-                h_h: pk.int32 = g_h >> 1
-                while h_h >= 1:
-                    def sort_hblk(j_s: int):
-                        ixj_h: pk.int32    = j_s ^ h_h
-                        do_cmp_h: pk.int32 = ixj_h > j_s
-                        asc_h: pk.int32    = (j_s & g_h) == 0
-                        d_j_h:   pk.float64 = Sbuf_d[j_s]
-                        d_ixj_h: pk.float64 = Sbuf_d[ixj_h]
-                        ns_h: pk.int32 = do_cmp_h * (asc_h * (d_j_h > d_ixj_h) + (1 - asc_h) * (d_j_h < d_ixj_h))
-                        tmp_d_h: pk.float64 = d_j_h
-                        tmp_i_h: pk.int32   = Sbuf_i[j_s]
-                        Sbuf_d[j_s]   = d_j_h   * (1 - ns_h) + d_ixj_h           * ns_h
-                        Sbuf_i[j_s]   = tmp_i_h * (1 - ns_h) + Sbuf_i[ixj_h]     * ns_h
-                        Sbuf_d[ixj_h] = d_ixj_h * (1 - ns_h) + tmp_d_h            * ns_h
-                        Sbuf_i[ixj_h] = Sbuf_i[ixj_h] * (1 - ns_h) + tmp_i_h     * ns_h
-                    pk.parallel_for(pk.TeamThreadRange(team_member, n2k), sort_hblk)
-                    team_member.team_barrier()
-                    h_h = h_h >> 1
-                g_h = g_h * 2
+            row_si: pk.int32 = 0
+            for row_si in range(b):
+                i_si: pk.int32 = row_si + i_off_h
+                def load_si(p: int):
+                    Sbuf_d[p]     = Gdst[n][i_si][p]
+                    Sbuf_i[p]     = Gidx[n][i_si][p]
+                    Sbuf_d[p + k] = Gdst[n][i_si][p + k]
+                    Sbuf_i[p + k] = Gidx[n][i_si][p + k]
+                pk.parallel_for(pk.TeamThreadRange(team_member, k), load_si)
+                team_member.team_barrier()
 
-            def store_hblk(p: int):
-                Gdst[n][i_mh][p]     = Sbuf_d[p]
-                Gidx[n][i_mh][p]     = Sbuf_i[p]
-                Gdst[n][i_mh][p + k] = INF
-                Gidx[n][i_mh][p + k] = -1
-            pk.parallel_for(pk.TeamThreadRange(team_member, k), store_hblk)
+                g_si: pk.int32 = 2
+                while g_si <= n2k:
+                    h_si: pk.int32 = g_si >> 1
+                    while h_si >= 1:
+                        def sort_si(j_s: int):
+                            ixj_si: pk.int32    = j_s ^ h_si
+                            do_cmp_si: pk.int32 = ixj_si > j_s
+                            asc_si: pk.int32    = (j_s & g_si) == 0
+                            d_j_si:   pk.float64 = Sbuf_d[j_s]
+                            d_ixj_si: pk.float64 = Sbuf_d[ixj_si]
+                            ns_si: pk.int32 = do_cmp_si * (asc_si * (d_j_si > d_ixj_si) + (1 - asc_si) * (d_j_si < d_ixj_si))
+                            tmp_d_si: pk.float64 = d_j_si
+                            tmp_i_si: pk.int32   = Sbuf_i[j_s]
+                            Sbuf_d[j_s]    = d_j_si   * (1 - ns_si) + d_ixj_si         * ns_si
+                            Sbuf_i[j_s]    = tmp_i_si * (1 - ns_si) + Sbuf_i[ixj_si]   * ns_si
+                            Sbuf_d[ixj_si] = d_ixj_si * (1 - ns_si) + tmp_d_si          * ns_si
+                            Sbuf_i[ixj_si] = Sbuf_i[ixj_si] * (1 - ns_si) + tmp_i_si   * ns_si
+                        pk.parallel_for(pk.TeamThreadRange(team_member, n2k), sort_si)
+                        team_member.team_barrier()
+                        h_si = h_si >> 1
+                    g_si = g_si * 2
+
+                def store_si(p: int):
+                    Gdst[n][i_si][p]     = Sbuf_d[p]
+                    Gidx[n][i_si][p]     = Sbuf_i[p]
+                    Gdst[n][i_si][p + k] = INF
+                    Gidx[n][i_si][p + k] = -1
+                pk.parallel_for(pk.TeamThreadRange(team_member, k), store_si)
+                team_member.team_barrier()
+
+        # J-side: one bitonic merge per row (upper half filled by hblk_col_body).
+        row_jh: pk.int32 = 0
+        for row_jh in range(blksize_h):
+            i_jh: pk.int32 = row_jh + b * hblk_i
+            def load_jh(p: int):
+                Sbuf_d[p]     = Gdst[n][i_jh][p]
+                Sbuf_i[p]     = Gidx[n][i_jh][p]
+                Sbuf_d[p + k] = Gdst[n][i_jh][p + k]
+                Sbuf_i[p + k] = Gidx[n][i_jh][p + k]
+            pk.parallel_for(pk.TeamThreadRange(team_member, k), load_jh)
+            team_member.team_barrier()
+
+            g_jh: pk.int32 = 2
+            while g_jh <= n2k:
+                h_jh: pk.int32 = g_jh >> 1
+                while h_jh >= 1:
+                    def sort_jh(j_s: int):
+                        ixj_jh: pk.int32    = j_s ^ h_jh
+                        do_cmp_jh: pk.int32 = ixj_jh > j_s
+                        asc_jh: pk.int32    = (j_s & g_jh) == 0
+                        d_j_jh:   pk.float64 = Sbuf_d[j_s]
+                        d_ixj_jh: pk.float64 = Sbuf_d[ixj_jh]
+                        ns_jh: pk.int32 = do_cmp_jh * (asc_jh * (d_j_jh > d_ixj_jh) + (1 - asc_jh) * (d_j_jh < d_ixj_jh))
+                        tmp_d_jh: pk.float64 = d_j_jh
+                        tmp_i_jh: pk.int32   = Sbuf_i[j_s]
+                        Sbuf_d[j_s]    = d_j_jh   * (1 - ns_jh) + d_ixj_jh         * ns_jh
+                        Sbuf_i[j_s]    = tmp_i_jh * (1 - ns_jh) + Sbuf_i[ixj_jh]   * ns_jh
+                        Sbuf_d[ixj_jh] = d_ixj_jh * (1 - ns_jh) + tmp_d_jh          * ns_jh
+                        Sbuf_i[ixj_jh] = Sbuf_i[ixj_jh] * (1 - ns_jh) + tmp_i_jh   * ns_jh
+                    pk.parallel_for(pk.TeamThreadRange(team_member, n2k), sort_jh)
+                    team_member.team_barrier()
+                    h_jh = h_jh >> 1
+                g_jh = g_jh * 2
+
+            def store_jh(p: int):
+                Gdst[n][i_jh][p]     = Sbuf_d[p]
+                Gidx[n][i_jh][p]     = Sbuf_i[p]
+                Gdst[n][i_jh][p + k] = INF
+                Gidx[n][i_jh][p + k] = -1
+            pk.parallel_for(pk.TeamThreadRange(team_member, k), store_jh)
             team_member.team_barrier()
 
 
