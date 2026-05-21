@@ -30,7 +30,10 @@ if __name__ == '__main__':
 
 
 # -----------------------------
-# fused pipeline kernel
+# fused pipeline kernel — max-heap topk (b=32 assumed)
+# Ldst[n][row][0] is always the worst (max-distance) element.
+# Each candidate: O(1) comparison against root, conditional replace,
+# then O(log k) branchless sift-down (6 fixed steps covers k <= 64).
 # -----------------------------
 @pk.workunit(scratch=[
     (pk.float32, lambda p: 2 * p.k),
@@ -40,10 +43,10 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
                         X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx,
                         m, d, k, b):
     INF: pk.float32 = 3.4028235e+38
+    HEAP_SIFT_STEPS: pk.int32 = 5  # log2(b) for b=32; covers heap depth for all k < b
     n: pk.int32 = team_member.league_rank()
     n2k: pk.int32 = 2 * k
 
-    # Team-level scratch memory (CUDA shared memory): one buffer per team.
     Sbuf_d: pk.ScratchView1D[pk.float32] = pk.ScratchView1D(team_member.team_scratch(0), n2k)
     Sbuf_i: pk.ScratchView1D[pk.int32]   = pk.ScratchView1D(team_member.team_scratch(0), n2k)
 
@@ -86,7 +89,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
         pk.parallel_for(pk.TeamThreadRange(team_member, n_pairs), dblk_body)
         team_member.team_barrier()
 
-    # ---- Phase 3: topk within diagonal blocks into Ldst[0..k-1] ----
+    # ---- Phase 3: topk within diagonal blocks — max-heap ----
     def topk_dblk_body(i: int):
         im: pk.int32 = i % b
         id_: pk.int32 = i - im
@@ -100,22 +103,36 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             idx1: pk.int32 = jm * i_first + im * (1 - i_first)
             val: pk.float32 = Dloc[n][idx0][idx1]
             not_self: pk.int32 = j != i
-            worst: pk.int32 = 0
-            t: pk.int32 = 0
-            prop: pk.int32 = 0
-            for t in range(1, k):
-                prop = Ldst[n][i][t] > Ldst[n][i][worst]
-                worst = t * prop + worst * (1 - prop)
-            prop = not_self * (val < Ldst[n][i][worst])
-            Ldst[n][i][worst] = val * prop + Ldst[n][i][worst] * (1 - prop)
-            Lidx[n][i][worst] = j * prop + Lidx[n][i][worst] * (1 - prop)
+            prop: pk.int32 = not_self * (val < Ldst[n][i][0])
+            Ldst[n][i][0] = val * prop + Ldst[n][i][0] * (1 - prop)
+            Lidx[n][i][0] = j   * prop + Lidx[n][i][0] * (1 - prop)
+            pos_h: pk.int32 = 0
+            step_h: pk.int32 = 0
+            for step_h in range(HEAP_SIFT_STEPS):
+                lh: pk.int32 = 2 * pos_h + 1
+                rh: pk.int32 = 2 * pos_h + 2
+                il: pk.int32 = lh < k
+                ir: pk.int32 = rh < k
+                sl: pk.int32 = lh * il + pos_h * (1 - il)
+                sr: pk.int32 = rh * ir + pos_h * (1 - ir)
+                bl: pk.int32 = il * (Ldst[n][i][sl] > Ldst[n][i][pos_h])
+                br: pk.int32 = ir * (Ldst[n][i][sr] > Ldst[n][i][pos_h])
+                pr: pk.int32 = br * (1 - bl * (Ldst[n][i][sl] > Ldst[n][i][sr]))
+                pl: pk.int32 = bl * (1 - pr)
+                gh: pk.int32 = pl + pr
+                ch: pk.int32 = sl * pl + sr * pr + pos_h * (1 - gh)
+                td: pk.float32 = Ldst[n][i][pos_h]
+                ti: pk.int32   = Lidx[n][i][pos_h]
+                Ldst[n][i][pos_h] = Ldst[n][i][pos_h] * (1 - gh) + Ldst[n][i][ch] * gh
+                Lidx[n][i][pos_h] = Lidx[n][i][pos_h] * (1 - gh) + Lidx[n][i][ch] * gh
+                Ldst[n][i][ch]    = Ldst[n][i][ch]    * (1 - gh) + td              * gh
+                Lidx[n][i][ch]    = Lidx[n][i][ch]    * (1 - gh) + ti              * gh
+                pos_h = ch
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), topk_dblk_body)
     team_member.team_barrier()
 
     # ---- Phase 4: collaborative bitonic merge — diagonal ----
-    # Rows processed serially; each sort stage is parallel across team threads.
-    # Sbuf_d/Sbuf_i are team scratch (CUDA shared memory), one slot per team.
     row_d: pk.int32 = 0
     for row_d in range(m):
         def load_diag(p: int):
@@ -154,7 +171,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
         pk.parallel_for(pk.TeamThreadRange(team_member, k), store_diag)
         team_member.team_barrier()
 
-    # ---- flush Ldst / Lidx (k slots) and Dloc ----
+    # ---- flush Ldst / Lidx and Dloc ----
     def flush_local(lin: int):
         row: pk.int32 = lin // k
         col: pk.int32 = lin % k
@@ -170,7 +187,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
     pk.parallel_for(pk.TeamThreadRange(team_member, m * b), flush_dloc)
     team_member.team_barrier()
 
-    # ---- Phase 5-7: off-diagonal (hblk) loop ----
+    # ---- Phase 5-7: off-diagonal (hblk) loop — max-heap topk ----
     hblk_i: pk.int32 = 0
     for hblk_i in range(1, l):
         blksize_h: pk.int32 = m - b * hblk_i
@@ -186,15 +203,31 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
                     dot += X[n][i_h][t] * X[n][j][t]
                 val: pk.float32 = -2.0 * dot + Xn[n][i_h] + Xn[n][j]
                 Dloc[n][jm][im_h] = val
-                worst: pk.int32 = 0
-                t2: pk.int32 = 0
-                prop: pk.int32 = 0
-                for t2 in range(1, k):
-                    prop = Ldst[n][j][t2] > Ldst[n][j][worst]
-                    worst = t2 * prop + worst * (1 - prop)
-                prop = val < Ldst[n][j][worst]
-                Ldst[n][j][worst] = val * prop + Ldst[n][j][worst] * (1 - prop)
-                Lidx[n][j][worst] = i_h * prop + Lidx[n][j][worst] * (1 - prop)
+                prop: pk.int32 = val < Ldst[n][j][0]
+                Ldst[n][j][0] = val * prop + Ldst[n][j][0] * (1 - prop)
+                Lidx[n][j][0] = i_h * prop + Lidx[n][j][0] * (1 - prop)
+                pos_h: pk.int32 = 0
+                step_h: pk.int32 = 0
+                for step_h in range(HEAP_SIFT_STEPS):
+                    lh: pk.int32 = 2 * pos_h + 1
+                    rh: pk.int32 = 2 * pos_h + 2
+                    il: pk.int32 = lh < k
+                    ir: pk.int32 = rh < k
+                    sl: pk.int32 = lh * il + pos_h * (1 - il)
+                    sr: pk.int32 = rh * ir + pos_h * (1 - ir)
+                    bl: pk.int32 = il * (Ldst[n][j][sl] > Ldst[n][j][pos_h])
+                    br: pk.int32 = ir * (Ldst[n][j][sr] > Ldst[n][j][pos_h])
+                    pr: pk.int32 = br * (1 - bl * (Ldst[n][j][sl] > Ldst[n][j][sr]))
+                    pl: pk.int32 = bl * (1 - pr)
+                    gh: pk.int32 = pl + pr
+                    ch: pk.int32 = sl * pl + sr * pr + pos_h * (1 - gh)
+                    td: pk.float32 = Ldst[n][j][pos_h]
+                    ti: pk.int32   = Lidx[n][j][pos_h]
+                    Ldst[n][j][pos_h] = Ldst[n][j][pos_h] * (1 - gh) + Ldst[n][j][ch] * gh
+                    Lidx[n][j][pos_h] = Lidx[n][j][pos_h] * (1 - gh) + Lidx[n][j][ch] * gh
+                    Ldst[n][j][ch]    = Ldst[n][j][ch]    * (1 - gh) + td              * gh
+                    Lidx[n][j][ch]    = Lidx[n][j][ch]    * (1 - gh) + ti              * gh
+                    pos_h = ch
 
         pk.parallel_for(pk.TeamThreadRange(team_member, blksize_h), hblk_col_body)
         team_member.team_barrier()
@@ -205,15 +238,31 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             for jm_r in range(blksize_h):
                 j_r: pk.int32 = jm_r + b * hblk_i
                 val_r: pk.float32 = Dloc[n][jm_r][im_r]
-                worst_r: pk.int32 = 0
-                t_r: pk.int32 = 0
-                prop_r: pk.int32 = 0
-                for t_r in range(1, k):
-                    prop_r = Ldst[n][i_r][t_r] > Ldst[n][i_r][worst_r]
-                    worst_r = t_r * prop_r + worst_r * (1 - prop_r)
-                prop_r = val_r < Ldst[n][i_r][worst_r]
-                Ldst[n][i_r][worst_r] = val_r * prop_r + Ldst[n][i_r][worst_r] * (1 - prop_r)
-                Lidx[n][i_r][worst_r] = j_r * prop_r + Lidx[n][i_r][worst_r] * (1 - prop_r)
+                prop_r: pk.int32 = val_r < Ldst[n][i_r][0]
+                Ldst[n][i_r][0] = val_r * prop_r + Ldst[n][i_r][0] * (1 - prop_r)
+                Lidx[n][i_r][0] = j_r   * prop_r + Lidx[n][i_r][0] * (1 - prop_r)
+                pos_r: pk.int32 = 0
+                step_r: pk.int32 = 0
+                for step_r in range(HEAP_SIFT_STEPS):
+                    lhr: pk.int32  = 2 * pos_r + 1
+                    rhr: pk.int32  = 2 * pos_r + 2
+                    ilr: pk.int32  = lhr < k
+                    irr: pk.int32  = rhr < k
+                    slr: pk.int32  = lhr * ilr + pos_r * (1 - ilr)
+                    srr: pk.int32  = rhr * irr + pos_r * (1 - irr)
+                    blr: pk.int32  = ilr * (Ldst[n][i_r][slr] > Ldst[n][i_r][pos_r])
+                    brr: pk.int32  = irr * (Ldst[n][i_r][srr] > Ldst[n][i_r][pos_r])
+                    prr: pk.int32  = brr * (1 - blr * (Ldst[n][i_r][slr] > Ldst[n][i_r][srr]))
+                    plr: pk.int32  = blr * (1 - prr)
+                    ghr: pk.int32  = plr + prr
+                    chr_: pk.int32 = slr * plr + srr * prr + pos_r * (1 - ghr)
+                    tdr: pk.float32 = Ldst[n][i_r][pos_r]
+                    tir: pk.int32   = Lidx[n][i_r][pos_r]
+                    Ldst[n][i_r][pos_r] = Ldst[n][i_r][pos_r] * (1 - ghr) + Ldst[n][i_r][chr_] * ghr
+                    Lidx[n][i_r][pos_r] = Lidx[n][i_r][pos_r] * (1 - ghr) + Lidx[n][i_r][chr_] * ghr
+                    Ldst[n][i_r][chr_]  = Ldst[n][i_r][chr_]  * (1 - ghr) + tdr                 * ghr
+                    Lidx[n][i_r][chr_]  = Lidx[n][i_r][chr_]  * (1 - ghr) + tir                 * ghr
+                    pos_r = chr_
 
         pk.parallel_for(pk.TeamThreadRange(team_member, b), topk_row_body)
         team_member.team_barrier()
@@ -277,11 +326,6 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
 
 
 def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
-    """
-    Gdst, Gidx : (N, m, k)   — k-best neighbors per point (ascending after merge)
-    Ldst, Lidx : (N, m, k)   — local block candidates
-    k must be a power of 2.
-    """
     policy = pk.TeamPolicy(N, pk.AUTO)
     pk.parallel_for(
         "MAIN_PIPELINE",

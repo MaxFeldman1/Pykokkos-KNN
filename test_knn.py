@@ -120,8 +120,10 @@ if args.pipeline == "knn_kokkos_keqb":
         pred = extract_knn(Gidx, Gdst, N, m, kk)
         compare(pred, gt, X_np, N, m, kk, f"keqb k=b={kk}")
 else:
-    X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx = fresh_tensors_std(N, m, b, k)
-    run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
-    pred = extract_knn(Gidx, Gdst, N, m, k)
-    print(f"N={N}  m={m}  d={d}  k={k}  b={b}")
-    compare(pred, gt_idx, X_np, N, m, k, "batched")
+    print(f"N={N}  m={m}  d={d}  b={b}")
+    for kk in [2, 4, 16, 32]:
+        gt = knn_brute(X_np, kk)
+        X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx = fresh_tensors_std(N, m, b, kk)
+        run_knn_pipeline(N, m, d, kk, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+        pred = extract_knn(Gidx, Gdst, N, m, kk)
+        compare(pred, gt, X_np, N, m, kk, f"k={kk}")
