@@ -261,7 +261,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             team_member.team_barrier()
 
         def flush_local_h(lin: int):
-            row: pk.int32 = lin // k
+            row: pk.int32 = merge_off + lin // k
             col: pk.int32 = lin % k
             Ldst[n][row][col] = INF
             Lidx[n][row][col] = -1
@@ -271,8 +271,8 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             col: pk.int32 = lin % b
             Dloc[n][row][col] = -1.0
 
-        pk.parallel_for(pk.TeamThreadRange(team_member, m * k), flush_local_h)
-        pk.parallel_for(pk.TeamThreadRange(team_member, m * b), flush_dloc_h)
+        pk.parallel_for(pk.TeamThreadRange(team_member, merge_count * k), flush_local_h)
+        pk.parallel_for(pk.TeamThreadRange(team_member, blksize_h * b), flush_dloc_h)
         team_member.team_barrier()
 
 
