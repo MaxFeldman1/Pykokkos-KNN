@@ -17,15 +17,15 @@ if __name__ == '__main__':
     b = 32
 
     np.random.seed(0)
-    X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float64)
+    X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float32)
 
     X    = torch.from_numpy(X_np.copy())
-    Xn   = torch.empty((N, m), dtype=torch.float64)
-    Dloc = torch.zeros((N, m, b), dtype=torch.float64)
+    Xn   = torch.empty((N, m), dtype=torch.float32)
+    Dloc = torch.zeros((N, m, b), dtype=torch.float32)
     Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-    Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float32).max, dtype=torch.float32)
     Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-    Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float32).max, dtype=torch.float32)
 
 
 # -----------------------------
@@ -35,7 +35,7 @@ if __name__ == '__main__':
 def compute_norm(i, X, Xn, d, m):
     n: pk.int32 = i // m
     im: pk.int32 = i % m
-    s: pk.float64 = 0.0
+    s: pk.float32 = 0.0
     t: pk.int32 = 0
     for t in range(d):
         s += X[n][im][t] * X[n][im][t]
@@ -54,10 +54,10 @@ def compute_dist_dblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blknum, blk
     for im in range(jm):
         i: pk.int32 = im + b * blknum
 
-        def dot_product(t: int, acc: pk.Acc[pk.double]):
+        def dot_product(t: int, acc: pk.Acc[pk.float]):
             acc += X[n][i][t] * X[n][j][t]
 
-        dot: pk.float64 = pk.parallel_reduce(pk.TeamThreadRange(team_member, d), dot_product)
+        dot: pk.float32 = pk.parallel_reduce(pk.TeamThreadRange(team_member, d), dot_product)
 
         if team_member.team_rank() == 0:
             Dloc[n][i][jm] = -2.0 * dot + Xn[n][i] + Xn[n][j]
@@ -77,10 +77,10 @@ def compute_dist_hblk(team_member: pk.TeamMember, X, Xn, Dloc, d, b, blksize, bl
     for im in range(b):
         i: pk.int32 = im + b * (blknum - 1)
 
-        def dot_product(t: int, acc: pk.Acc[pk.double]):
+        def dot_product(t: int, acc: pk.Acc[pk.float]):
             acc += X[n][i][t] * X[n][j][t]
 
-        dot: pk.float64 = pk.parallel_reduce(pk.TeamThreadRange(team_member, d), dot_product)
+        dot: pk.float32 = pk.parallel_reduce(pk.TeamThreadRange(team_member, d), dot_product)
 
         if team_member.team_rank() == 0:
             Dloc[n][jm][im] = -2.0 * dot + Xn[n][i] + Xn[n][j]
@@ -106,7 +106,7 @@ def topk_row_dblk(i, Dloc, Lidx, Ldst, m, k, b):
         i_first: pk.int32 = im <= jm
         idx0: pk.int32 = row * i_first + j * (1 - i_first)
         idx1: pk.int32 = jm * i_first + im * (1 - i_first)
-        val: pk.float64 = Dloc[n][idx0][idx1]
+        val: pk.float32 = Dloc[n][idx0][idx1]
 
         worst: pk.int32 = 0
         t: pk.int32 = 0
@@ -129,7 +129,7 @@ def topk_row_hblk(i, Dloc, Lidx, Ldst, k, b, blksize, blknum):
     prop: pk.int32 = 0
     for jm in range(blksize):
         j: pk.int32 = jm + b * blknum
-        val: pk.float64 = Dloc[n][jm][im]
+        val: pk.float32 = Dloc[n][jm][im]
         worst: pk.int32 = 0
         t: pk.int32 = 0
         for t in range(1, k + 1):
@@ -151,7 +151,7 @@ def topk_col_hblk(i, Dloc, Lidx, Ldst, k, b, blknum, blksize):
     prop: pk.int32 = 0
     for im in range(b):
         row: pk.int32 = im + b * (blknum - 1)
-        val: pk.float64 = Dloc[n][jm][im]
+        val: pk.float32 = Dloc[n][jm][im]
 
         worst: pk.int32 = 0
         t: pk.int32 = 0
@@ -172,7 +172,7 @@ def merge_topk(i, Gdst, Gidx, Ldst, Lidx, k, offset, count):
     s: pk.int32 = 0
     prop: pk.int32 = 0
     for s in range(k + 1):
-        dst: pk.float64 = Ldst[n][row][s]
+        dst: pk.float32 = Ldst[n][row][s]
         idx: pk.int32 = Lidx[n][row][s]
 
         worst: pk.int32 = 0
@@ -193,7 +193,7 @@ def flush_local(i, Ldst, Lidx, k, m):
     rem: pk.int32 = i % total
     row: pk.int32 = rem // (k + 1)
     col: pk.int32 = rem % (k + 1)
-    Ldst[n][row][col] = 1.7976931348623157e+308
+    Ldst[n][row][col] = 3.4028235e+38
     Lidx[n][row][col] = -1
 
 

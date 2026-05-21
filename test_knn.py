@@ -17,7 +17,7 @@ k = 2
 b = 32
 
 np.random.seed(42)
-X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float64)
+X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float32)
 
 # -----------------------------
 # ground truth (numpy brute force, per dataset)
@@ -51,20 +51,20 @@ else:
 def fresh_tensors_std(N, m, b, k):
     """Standard pipeline: Gdst/Gidx/Ldst/Lidx all (N, m, k)."""
     X    = torch.from_numpy(X_np.copy())
-    Xn   = torch.empty((N, m), dtype=torch.float64)
-    Dloc = torch.zeros((N, m, b), dtype=torch.float64)
-    Gdst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Xn   = torch.empty((N, m), dtype=torch.float32)
+    Dloc = torch.zeros((N, m, b), dtype=torch.float32)
+    Gdst = torch.full((N, m, k), torch.finfo(torch.float32).max, dtype=torch.float32)
     Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
-    Ldst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Ldst = torch.full((N, m, k), torch.finfo(torch.float32).max, dtype=torch.float32)
     Lidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
     return X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx
 
 def fresh_tensors_keqb(N, m, b, k):
     """keqb pipeline: Gdst/Gidx (N, m, 2k), no Ldst/Lidx."""
     X    = torch.from_numpy(X_np.copy())
-    Xn   = torch.empty((N, m), dtype=torch.float64)
-    Dloc = torch.zeros((N, m, b), dtype=torch.float64)
-    Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Xn   = torch.empty((N, m), dtype=torch.float32)
+    Dloc = torch.zeros((N, m, b), dtype=torch.float32)
+    Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float32).max, dtype=torch.float32)
     Gidx = torch.full((N, m, 2 * k), -1,                             dtype=torch.int32)
     return X, Xn, Dloc, Gdst, Gidx
 

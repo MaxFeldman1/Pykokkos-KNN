@@ -92,19 +92,19 @@ np.random.seed(0)
 lines = [f"m={m}", f"d={d}", f"k={k}", f"b={b}", ""]
 
 for N in Ns:
-    X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float64)
+    X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float32)
     X    = torch.from_numpy(X_np)
-    Xn   = torch.empty((N, m), dtype=torch.float64)
-    Dloc = torch.zeros((N, m, b), dtype=torch.float64)
+    Xn   = torch.empty((N, m), dtype=torch.float32)
+    Dloc = torch.zeros((N, m, b), dtype=torch.float32)
 
     if args.pipeline == "knn_kokkos_keqb":
-        Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float64).max, dtype=torch.float64)
+        Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float32).max, dtype=torch.float32)
         Gidx = torch.full((N, m, 2 * k), -1,                             dtype=torch.int32)
         call_args = (N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx)
     else:
-        Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+        Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float32).max, dtype=torch.float32)
         Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
-        Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
+        Ldst = torch.full((N, m, k + 1), torch.finfo(torch.float32).max, dtype=torch.float32)
         Lidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
         call_args = (N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
 

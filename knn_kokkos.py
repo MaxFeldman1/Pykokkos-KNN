@@ -17,39 +17,39 @@ if __name__ == '__main__':
     b = 32
 
     np.random.seed(0)
-    X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float64)
+    X_np = np.random.randint(0, 8, size=(N, m, d)).astype(np.float32)
 
     X    = torch.from_numpy(X_np.copy())
-    Xn   = torch.empty((N, m), dtype=torch.float64)
-    Dloc = torch.zeros((N, m, b), dtype=torch.float64)
+    Xn   = torch.empty((N, m), dtype=torch.float32)
+    Dloc = torch.zeros((N, m, b), dtype=torch.float32)
 
     Gidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
-    Gdst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Gdst = torch.full((N, m, k), torch.finfo(torch.float32).max, dtype=torch.float32)
     Lidx = torch.full((N, m, k), -1,                             dtype=torch.int32)
-    Ldst = torch.full((N, m, k), torch.finfo(torch.float64).max, dtype=torch.float64)
+    Ldst = torch.full((N, m, k), torch.finfo(torch.float32).max, dtype=torch.float32)
 
 
 # -----------------------------
 # fused pipeline kernel
 # -----------------------------
 @pk.workunit(scratch=[
-    (pk.float64, lambda p: 2 * p.k),
+    (pk.float32, lambda p: 2 * p.k),
     (pk.int32,   lambda p: 2 * p.k),
 ])
 def knn_pipeline_kernel(team_member: pk.TeamMember,
                         X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx,
                         m, d, k, b):
-    INF: pk.float64 = 1.7976931348623157e+308
+    INF: pk.float32 = 3.4028235e+38
     n: pk.int32 = team_member.league_rank()
     n2k: pk.int32 = 2 * k
 
     # Team-level scratch memory (CUDA shared memory): one buffer per team.
-    Sbuf_d: pk.ScratchView1D[pk.float64] = pk.ScratchView1D(team_member.team_scratch(0), n2k)
+    Sbuf_d: pk.ScratchView1D[pk.float32] = pk.ScratchView1D(team_member.team_scratch(0), n2k)
     Sbuf_i: pk.ScratchView1D[pk.int32]   = pk.ScratchView1D(team_member.team_scratch(0), n2k)
 
     # ---- Phase 1: norms ----
     def norm_body(i: int):
-        s: pk.float64 = 0.0
+        s: pk.float32 = 0.0
         t: pk.int32 = 0
         for t in range(d):
             s += X[n][i][t] * X[n][i][t]
@@ -77,7 +77,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             im: pk.int32 = lin - start
             i: pk.int32 = im + b * blknum
             j: pk.int32 = jm + b * blknum
-            dot: pk.float64 = 0.0
+            dot: pk.float32 = 0.0
             t: pk.int32 = 0
             for t in range(d):
                 dot += X[n][i][t] * X[n][j][t]
@@ -98,7 +98,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             i_first: pk.int32 = im <= jm
             idx0: pk.int32 = i * i_first + j * (1 - i_first)
             idx1: pk.int32 = jm * i_first + im * (1 - i_first)
-            val: pk.float64 = Dloc[n][idx0][idx1]
+            val: pk.float32 = Dloc[n][idx0][idx1]
             not_self: pk.int32 = j != i
             worst: pk.int32 = 0
             t: pk.int32 = 0
@@ -134,10 +134,10 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
                     ixj_d: pk.int32   = j_s ^ h_d
                     do_cmp_d: pk.int32 = ixj_d > j_s
                     asc_d: pk.int32   = (j_s & g_d) == 0
-                    d_j_d:   pk.float64 = Sbuf_d[j_s]
-                    d_ixj_d: pk.float64 = Sbuf_d[ixj_d]
+                    d_j_d:   pk.float32 = Sbuf_d[j_s]
+                    d_ixj_d: pk.float32 = Sbuf_d[ixj_d]
                     ns_d: pk.int32 = do_cmp_d * (asc_d * (d_j_d > d_ixj_d) + (1 - asc_d) * (d_j_d < d_ixj_d))
-                    tmp_d_d: pk.float64 = d_j_d
+                    tmp_d_d: pk.float32 = d_j_d
                     tmp_i_d: pk.int32   = Sbuf_i[j_s]
                     Sbuf_d[j_s]    = d_j_d   * (1 - ns_d) + d_ixj_d           * ns_d
                     Sbuf_i[j_s]    = tmp_i_d * (1 - ns_d) + Sbuf_i[ixj_d]     * ns_d
@@ -180,11 +180,11 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             im_h: pk.int32 = 0
             for im_h in range(b):
                 i_h: pk.int32 = im_h + b * (hblk_i - 1)
-                dot: pk.float64 = 0.0
+                dot: pk.float32 = 0.0
                 t: pk.int32 = 0
                 for t in range(d):
                     dot += X[n][i_h][t] * X[n][j][t]
-                val: pk.float64 = -2.0 * dot + Xn[n][i_h] + Xn[n][j]
+                val: pk.float32 = -2.0 * dot + Xn[n][i_h] + Xn[n][j]
                 Dloc[n][jm][im_h] = val
                 worst: pk.int32 = 0
                 t2: pk.int32 = 0
@@ -204,7 +204,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             jm_r: pk.int32 = 0
             for jm_r in range(blksize_h):
                 j_r: pk.int32 = jm_r + b * hblk_i
-                val_r: pk.float64 = Dloc[n][jm_r][im_r]
+                val_r: pk.float32 = Dloc[n][jm_r][im_r]
                 worst_r: pk.int32 = 0
                 t_r: pk.int32 = 0
                 prop_r: pk.int32 = 0
@@ -240,10 +240,10 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
                         ixj_h: pk.int32    = j_s ^ h_h
                         do_cmp_h: pk.int32 = ixj_h > j_s
                         asc_h: pk.int32    = (j_s & g_h) == 0
-                        d_j_h:   pk.float64 = Sbuf_d[j_s]
-                        d_ixj_h: pk.float64 = Sbuf_d[ixj_h]
+                        d_j_h:   pk.float32 = Sbuf_d[j_s]
+                        d_ixj_h: pk.float32 = Sbuf_d[ixj_h]
                         ns_h: pk.int32 = do_cmp_h * (asc_h * (d_j_h > d_ixj_h) + (1 - asc_h) * (d_j_h < d_ixj_h))
-                        tmp_d_h: pk.float64 = d_j_h
+                        tmp_d_h: pk.float32 = d_j_h
                         tmp_i_h: pk.int32   = Sbuf_i[j_s]
                         Sbuf_d[j_s]   = d_j_h   * (1 - ns_h) + d_ixj_h        * ns_h
                         Sbuf_i[j_s]   = tmp_i_h * (1 - ns_h) + Sbuf_i[ixj_h]  * ns_h
