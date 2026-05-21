@@ -11,7 +11,7 @@ import torch
     (pk.int32,   lambda p: 2 * p.k),
 ])
 def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
-                              X, Xn, Dloc, Gdst, Gidx,
+                              X, Xn, Dloc, Iloc, Gdst, Gidx,
                               m, d, k, b):
     INF: pk.float64 = 1.7976931348623157e+308
     n: pk.int32 = team_member.league_rank()
@@ -144,6 +144,7 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
                     dot += X[n][i_h][t] * X[n][j][t]
                 val: pk.float64 = -2.0 * dot + Xn[n][i_h] + Xn[n][j]
                 Dloc[n][jm][im_h] = val
+                Iloc[n][jm][im_h] = j
                 Gdst[n][j][k + im_h] = val
                 Gidx[n][j][k + im_h] = i_h
 
@@ -164,7 +165,7 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
                 slot_f: pk.int32 = 0
                 for slot_f in range(sub_sz_h):
                     Gdst[n][i_r_f][k + slot_f] = Dloc[n][sub_off_h + slot_f][im_r]
-                    Gidx[n][i_r_f][k + slot_f] = sub_off_h + slot_f + b * hblk_i
+                    Gidx[n][i_r_f][k + slot_f] = Iloc[n][sub_off_h + slot_f][im_r]
             pk.parallel_for(pk.TeamThreadRange(team_member, b), fill_irows)
             team_member.team_barrier()
 
@@ -252,13 +253,13 @@ def knn_pipeline_kernel_keqb(team_member: pk.TeamMember,
             team_member.team_barrier()
 
 
-def run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx):
+def run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Iloc, Gdst, Gidx):
     policy = pk.TeamPolicy(N, pk.AUTO)
     pk.parallel_for(
         "MAIN_PIPELINE_KEQB",
         policy,
         knn_pipeline_kernel_keqb,
-        X=X, Xn=Xn, Dloc=Dloc, Gdst=Gdst, Gidx=Gidx,
+        X=X, Xn=Xn, Dloc=Dloc, Iloc=Iloc, Gdst=Gdst, Gidx=Gidx,
         m=m, d=d, k=k, b=b
     )
     pk.fence()

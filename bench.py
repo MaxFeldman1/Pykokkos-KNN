@@ -98,9 +98,10 @@ for N in Ns:
     Dloc = torch.zeros((N, m, b), dtype=torch.float64)
 
     if args.pipeline == "knn_kokkos_keqb":
+        Iloc = torch.zeros((N, m, b), dtype=torch.int32)
         Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float64).max, dtype=torch.float64)
         Gidx = torch.full((N, m, 2 * k), -1,                             dtype=torch.int32)
-        call_args = (N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx)
+        call_args = (N, m, d, k, b, X, Xn, Dloc, Iloc, Gdst, Gidx)
     else:
         Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
         Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)

@@ -64,9 +64,10 @@ def fresh_tensors_keqb(N, m, b, k):
     X    = torch.from_numpy(X_np.copy())
     Xn   = torch.empty((N, m), dtype=torch.float64)
     Dloc = torch.zeros((N, m, b), dtype=torch.float64)
+    Iloc = torch.zeros((N, m, b), dtype=torch.int32)
     Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float64).max, dtype=torch.float64)
     Gidx = torch.full((N, m, 2 * k), -1,                             dtype=torch.int32)
-    return X, Xn, Dloc, Gdst, Gidx
+    return X, Xn, Dloc, Iloc, Gdst, Gidx
 
 def extract_knn(Gidx, Gdst, N, m, k):
     # Works for both standard (size k) and keqb (size 2k): argsort puts real
@@ -115,8 +116,8 @@ if args.pipeline == "knn_kokkos_keqb":
     print(f"N={N}  m={m}  d={d}")
     for kk in [4, 8, 16, 32]:
         gt = knn_brute(X_np, kk)
-        X, Xn, Dloc, Gdst, Gidx = fresh_tensors_keqb(N, m, kk, kk)
-        run_knn_pipeline_keqb(N, m, d, kk, kk, X, Xn, Dloc, Gdst, Gidx)
+        X, Xn, Dloc, Iloc, Gdst, Gidx = fresh_tensors_keqb(N, m, kk, kk)
+        run_knn_pipeline_keqb(N, m, d, kk, kk, X, Xn, Dloc, Iloc, Gdst, Gidx)
         pred = extract_knn(Gidx, Gdst, N, m, kk)
         compare(pred, gt, X_np, N, m, kk, f"keqb k=b={kk}")
 else:

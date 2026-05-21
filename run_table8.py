@@ -72,9 +72,10 @@ for d in ds:
 
         if args.pipeline == "fused" and k == b:
             from knn_kokkos_keqb import run_knn_pipeline_keqb
+            Iloc = torch.zeros((N, m, b), dtype=torch.int32)
             Gdst = torch.full((N, m, 2 * k), torch.finfo(torch.float64).max, dtype=torch.float64)
             Gidx = torch.full((N, m, 2 * k), -1,                             dtype=torch.int32)
-            _call = lambda: run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx)
+            _call = lambda: run_knn_pipeline_keqb(N, m, d, k, b, X, Xn, Dloc, Iloc, Gdst, Gidx)
         else:
             Gdst = torch.full((N, m, k + 1), torch.finfo(torch.float64).max, dtype=torch.float64)
             Gidx = torch.full((N, m, k + 1), -1,                             dtype=torch.int32)
