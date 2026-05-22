@@ -117,7 +117,11 @@ def load_pipeline(name):
             if result.returncode != 0:
                 sys.exit("Compilation failed.")
         def cpp_runner(run_N, m_, run_d, k_, *_ignored):
-            subprocess.run([binary, str(run_N), str(m_), str(run_d), str(k_)], check=True)
+            result = subprocess.run(
+                [binary, str(run_N), str(m_), str(run_d), str(k_)],
+                check=True, capture_output=True, text=True,
+            )
+            return float(result.stdout.strip().splitlines()[-1])
         return cpp_runner, b
     elif name == "unfused_knn_kokkos":
         from unfused_knn_kokkos import run_knn_pipeline
@@ -173,10 +177,9 @@ for pipeline_name in pipeline_names:
 
         for i in range(3):
             t0 = time.time()
-            run_fn(*call_args)
+            ret = run_fn(*call_args)
             t1 = time.time()
-
-        ms = (t1 - t0) * 1000
+            ms = ret if ret is not None else (t1 - t0) * 1000
         print(f"{label}\n{ms:.3f}")
 
         lines.append(label)
