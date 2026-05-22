@@ -175,7 +175,18 @@ if sweep_var == 'N':
 # -----------------------------
 # plot
 # -----------------------------
-fig, ax = plt.subplots(figsize=(11, 6))
+plt.rcParams.update({
+    'font.size':        13,
+    'axes.titlesize':   14,
+    'axes.labelsize':   13,
+    'xtick.labelsize':  12,
+    'ytick.labelsize':  12,
+    'legend.fontsize':  12,
+    'lines.linewidth':  2.0,
+    'lines.markersize': 7,
+})
+
+fig, ax = plt.subplots(figsize=(15, 8))
 
 for i, name in enumerate(pipeline_names):
     data = pipeline_data[name]
@@ -188,7 +199,7 @@ for i, name in enumerate(pipeline_names):
          FALLBACK_MARKERS[i % len(FALLBACK_MARKERS)])
     )
     ax.errorbar(xs, means, yerr=stds if any(s > 0 for s in stds) else None,
-                fmt=f'{marker}-', color=color, capsize=4, label=name)
+                fmt=f'{marker}-', color=color, capsize=5, label=name)
 
 if sweep_var == 'N':
     ax.plot(N_model, t_no_mem,   '--', color='gray', linewidth=1.5, label='Napkin compute-only')
@@ -199,22 +210,22 @@ if sweep_var == 'N':
     ax.axvline(N_SMs, color='silver', linestyle=':', linewidth=1)
     _, y_top = ax.get_ylim()
     ax.text(N_SMs + 5, y_top * 0.05 if y_top > 0 else 1,
-            f'N={N_SMs}', color='gray', fontsize=9)
+            f'N={N_SMs}', color='gray', fontsize=12)
 
 # axis labels and title
 if sweep_var == 'N':
     fixed_str = f'm={m_val}  d={d_val}  k={k_val}  b={b_val}'
-    ax.set_xlabel('N (number of datasets / league size)', fontsize=12)
-    ax.set_title(f'KNN pipeline wall time vs N  |  {fixed_str}  |  GH200', fontsize=11)
+    ax.set_xlabel('N (number of datasets / league size)')
+    ax.set_title(f'KNN pipeline wall time vs N  |  {fixed_str}  |  GH200')
 else:
     n_fixed = N_val if N_val is not None else '?'
     fixed_str = f'N={n_fixed}  m={m_val}  k={k_val}  b={b_val}'
-    ax.set_xlabel('d (feature dimension)', fontsize=12)
-    ax.set_title(f'KNN pipeline wall time vs d  |  {fixed_str}  |  GH200', fontsize=11)
+    ax.set_xlabel('d (feature dimension)')
+    ax.set_title(f'KNN pipeline wall time vs d  |  {fixed_str}  |  GH200')
 
-ax.set_ylabel('Wall time (ms)', fontsize=12)
+ax.set_ylabel('Wall time (ms)')
 ax.set_yscale('log')
-ax.legend(fontsize=9)
+ax.legend(framealpha=0.9, edgecolor='gray')
 ax.grid(True, alpha=0.3, which='both')
 
 plt.tight_layout()

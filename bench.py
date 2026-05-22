@@ -25,7 +25,7 @@ b = 32
 Ns           = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 132, 133, 144, 160, 192, 256, 384, 512, 640, 768, 896, 1024]
 N_fixed      = 500
 ds           = [4, 8, 16, 32, 64, 128, 256, 512]
-ALL_PIPELINES = ["knn_kokkos", "knn_kokkos_keqb", "unfused_knn_kokkos", "gemm_knn_kokkos"]
+ALL_PIPELINES = ["knn_kokkos", "knn_kokkos_keqb", "unfused_knn_kokkos", "gemm_knn_kokkos", "cpp"]
 
 print(f"Benchmarking: {args.pipeline}  sweep={args.sweep}")
 
@@ -94,8 +94,32 @@ if args.pipeline == "cpp":
 # Python pipelines
 # -----------------------------
 def load_pipeline(name):
-    """Returns (run_fn, effective_b)."""
-    if name == "unfused_knn_kokkos":
+    """Returns (run_fn, effective_b).
+    run_fn accepts (N, m, d, k, b, X, Xn, Dloc, ...) — cpp ignores the tensors.
+    """
+    if name == "cpp":
+        knn_dir = os.path.dirname(os.path.abspath(__file__))
+        binary  = os.path.join(knn_dir, "cpp_bench")
+        src     = os.path.join(knn_dir, "cpp_bench.cu")
+        fiknn   = os.path.join(knn_dir, "../pyrknn/GeMM/pysrc/filknn/dense/dfiknn_test.cu")
+        inc     = os.path.join(knn_dir, "../pyrknn/GeMM/pysrc/filknn/dense")
+        needs_build = (
+            not os.path.exists(binary)
+            or os.path.getmtime(src)   > os.path.getmtime(binary)
+            or os.path.getmtime(fiknn) > os.path.getmtime(binary)
+        )
+        if needs_build:
+            compile_cmd = ["nvcc", f"-I{knn_dir}", f"-I{inc}",
+                           "-gencode", "arch=compute_90,code=sm_90",
+                           fiknn, src, "-O2", "-lcublas", "-o", binary]
+            print("Compiling cpp_bench:", " ".join(compile_cmd))
+            result = subprocess.run(compile_cmd)
+            if result.returncode != 0:
+                sys.exit("Compilation failed.")
+        def cpp_runner(run_N, m_, run_d, k_, *_ignored):
+            subprocess.run([binary, str(run_N), str(m_), str(run_d), str(k_)], check=True)
+        return cpp_runner, b
+    elif name == "unfused_knn_kokkos":
         from unfused_knn_kokkos import run_knn_pipeline
         return run_knn_pipeline, b
     elif name == "gemm_knn_kokkos":
