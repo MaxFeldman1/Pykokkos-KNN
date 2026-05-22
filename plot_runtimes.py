@@ -7,33 +7,56 @@ import matplotlib.pyplot as plt
 # -----------------------------
 DEFAULT_PARAMS = {'m': 12000, 'd': 70, 'k': 2, 'b': 32}
 
-def parse_file(filename, default_params=None):
-    """Return (params dict, {N: runtime_ms}) from a runtimes text file.
-    Files may or may not have a param header; each N block has one runtime."""
-    params = dict(default_params or DEFAULT_PARAMS)
-    data = {}
-    current_N = None
+def parse_all_file(filename):
+    """Parse a bench.py 'all' (or single-pipeline) output file.
+
+    Returns:
+        params        — dict of fixed parameters from the header
+        sweep_var     — 'N' or 'd'
+        pipeline_order — list of pipeline names in file order
+        pipeline_data  — {pipeline_name: {sweep_val: [runtimes]}}
+    """
+    params = {}
+    pipeline_data = {}
+    pipeline_order = []
+    current_pipeline = None
+    current_val = None
+    sweep_var = None
+
     with open(filename) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+
+            pm = re.match(r'^pipeline=(\S+)$', line)
+            if pm:
+                current_pipeline = pm.group(1)
+                if current_pipeline not in pipeline_data:
+                    pipeline_data[current_pipeline] = {}
+                    pipeline_order.append(current_pipeline)
+                current_val = None
+                continue
+
             m = re.match(r'^([a-zA-Z]+)=(\d+)$', line)
             if m:
                 key, val = m.group(1), int(m.group(2))
-                if key == 'N':
-                    current_N = val
-                    data.setdefault(current_N, [])
-                else:
+                if current_pipeline is None:
                     params[key] = val
-            else:
-                try:
-                    runtime = float(line)
-                    if current_N is not None:
-                        data[current_N].append(runtime)
-                except ValueError:
-                    pass
-    return params, data
+                else:
+                    sweep_var = key
+                    current_val = val
+                    pipeline_data[current_pipeline].setdefault(val, [])
+                continue
+
+            try:
+                runtime = float(line)
+                if current_pipeline is not None and current_val is not None:
+                    pipeline_data[current_pipeline][current_val].append(runtime)
+            except ValueError:
+                pass
+
+    return params, sweep_var, pipeline_order, pipeline_data
 
 
 def mem_napkin_time_ms(N, m_val, d_val, k_val, b_val,
@@ -54,14 +77,12 @@ def mem_napkin_time_ms(N, m_val, d_val, k_val, b_val,
     l = int(np.ceil(m_val / b_val))
     hblk_pairs = sum(b_val * (m_val - b_val * h) for h in range(1, l))
 
-    # Total logical bytes loaded across the full pipeline per dataset (as if no cache).
-    # hblk X reads dominate: every (i,j) pair reads Xi and Xj in full.
     total_bytes_per_ds = (
-        hblk_pairs * 2 * d_val * 8          # hblk: X[i] + X[j] per pair
-        + hblk_pairs * 2 * 8                 # hblk: Xn[i] + Xn[j] per pair
-        + hblk_pairs * 8                     # hblk: Dloc write per pair
-        + m_val * d_val * 8                  # norm phase: X read once
-        + m_val * (k_val + 1) * 8 * 4       # topk/merge: Gdst, Gidx, Ldst, Lidx
+        hblk_pairs * 2 * d_val * 8
+        + hblk_pairs * 2 * 8
+        + hblk_pairs * 8
+        + m_val * d_val * 8
+        + m_val * (k_val + 1) * 8 * 4
     )
 
     T_mem_ms = N * total_bytes_per_ds * L2_MISS_RATE / HBM_BW * 1e3
@@ -71,7 +92,6 @@ def mem_napkin_time_ms(N, m_val, d_val, k_val, b_val,
 
 def non_hblk_napkin_time_ms(N, m_val, d_val, k_val, b_val,
                              TFLOPS_TOTAL=33.5e12, HBM_BW=4e12):
-    """Time for everything except the hblk distance kernel (norms + topk + merge + flush)."""
     L2_MISS_RATE = 0.1
     pairs_per_ds = (m_val - 1) * m_val / 2
     flops_norms  = m_val * (2 * d_val)
@@ -81,12 +101,11 @@ def non_hblk_napkin_time_ms(N, m_val, d_val, k_val, b_val,
     l = int(np.ceil(m_val / b_val))
     hblk_pairs = sum(b_val * (m_val - b_val * h) for h in range(1, l))
 
-    # All bytes except the dominant hblk X[i]+X[j] reads
     non_hblk_bytes = (
-        hblk_pairs * 2 * 8                # hblk: Xn[i] + Xn[j] per pair
-        + hblk_pairs * 8                   # Dloc write (dist kernel) + read (topk kernel)
-        + m_val * d_val * 8                # norm phase: X read once
-        + m_val * (k_val + 1) * 8 * 4     # topk/merge: Gdst, Gidx, Ldst, Lidx
+        hblk_pairs * 2 * 8
+        + hblk_pairs * 8
+        + m_val * d_val * 8
+        + m_val * (k_val + 1) * 8 * 4
     )
 
     T_compute_ms = N * FLOPS_NON_HBLK / TFLOPS_TOTAL * 1e3
@@ -108,102 +127,121 @@ def napkin_time_ms(N, m_val, d_val, k_val, b_val,
 
 
 # -----------------------------
-# load all three files
+# pipeline styles
 # -----------------------------
-pipelines = [
-    ('fused',   'fused_runtimes.txt',   'steelblue',       'o'),
-    ('unfused', 'unfused_runtimes.txt', 'darkorange',      's'),
-    ('gemm',    'gemm_runtimes.txt',    'mediumseagreen',  '^'),
-    ('cpp',     'cpp_runtimes.txt',     'mediumpurple',    'D'),
-]
+PIPELINE_STYLE = {
+    'knn_kokkos':         ('steelblue',      'o'),
+    'knn_kokkos_keqb':    ('tomato',         's'),
+    'unfused_knn_kokkos': ('darkorange',     '^'),
+    'gemm_knn_kokkos':    ('mediumseagreen', 'D'),
+    'cpp':                ('mediumpurple',   'x'),
+}
+FALLBACK_COLORS  = ['gray', 'olive', 'deeppink', 'cyan']
+FALLBACK_MARKERS = ['v', '<', '>', 'p']
 
-all_data   = {}   # name -> (params, {N: [runtimes]})
-for name, fname, _color, _marker in pipelines:
-    try:
-        params, data = parse_file(fname)
-        all_data[name] = (params, data)
-    except FileNotFoundError:
-        print(f"Warning: {fname} not found — skipping {name}")
 
 # -----------------------------
-# napkin math lines (one per unique param set)
+# load
 # -----------------------------
-# Key by (m, d, k, b) so pipelines sharing params share one model line.
-seen_params = {}
-for name, (params, _) in all_data.items():
-    key = (params['m'], params['d'], params['k'], params['b'])
-    seen_params.setdefault(key, []).append(name)
+filename = "runtimes.txt"
+params, sweep_var, pipeline_names, pipeline_data = parse_all_file(filename)
 
-all_Ns = sorted({n for _, (_, d) in all_data.items() for n in d})
-N_model = np.array(sorted(set(all_Ns + list(range(1, max(all_Ns) + 1, max(1, max(all_Ns) // 200))))))
+m_val = params.get('m', DEFAULT_PARAMS['m'])
+d_val = params.get('d', DEFAULT_PARAMS['d'])
+k_val = params.get('k', DEFAULT_PARAMS['k'])
+b_val = params.get('b', DEFAULT_PARAMS['b'])
+N_val = params.get('N', None)   # set for d-sweep (fixed N in header)
 
-napkin_lines = {}   # key -> (t_compute_only, t_with_mem, t_non_hblk)
-for key in seen_params:
-    m_val, d_val, k_val, b_val = key
+if sweep_var is None:
+    raise ValueError(f"No sweep variable detected in {filename}")
+
+print(f"Sweep variable: {sweep_var}")
+print(f"Pipelines found: {pipeline_names}")
+print(f"Params: {params}")
+
+# -----------------------------
+# napkin math (N-sweep only)
+# -----------------------------
+napkin_artists = []
+if sweep_var == 'N':
+    all_xs = sorted({x for name in pipeline_names for x in pipeline_data[name]})
+    N_model = np.array(sorted(set(
+        all_xs + list(range(1, max(all_xs) + 1, max(1, max(all_xs) // 200)))
+    )))
     t_no_mem   = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=False) for n in N_model])
     t_with_mem = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=True)  for n in N_model])
     t_non_hblk = np.array([non_hblk_napkin_time_ms(n, m_val, d_val, k_val, b_val)            for n in N_model])
-    napkin_lines[key] = (t_no_mem, t_with_mem, t_non_hblk)
 
 # -----------------------------
 # plot
 # -----------------------------
 fig, ax = plt.subplots(figsize=(11, 6))
 
-for name, fname, color, marker in pipelines:
-    if name not in all_data:
-        continue
-    params, data = all_data[name]
-    Ns    = sorted(data.keys())
-    means = [np.mean(data[n]) for n in Ns]
-    stds  = [np.std(data[n])  for n in Ns]
-    ax.errorbar(Ns, means, yerr=stds if any(s > 0 for s in stds) else None,
-                fmt=f'{marker}-', color=color, capsize=4,
-                label=f'{name}  (m={params["m"]})')
+for i, name in enumerate(pipeline_names):
+    data = pipeline_data[name]
+    xs    = sorted(data.keys())
+    means = [np.mean(data[x]) for x in xs]
+    stds  = [np.std(data[x])  for x in xs]
+    color, marker = PIPELINE_STYLE.get(
+        name,
+        (FALLBACK_COLORS[i % len(FALLBACK_COLORS)],
+         FALLBACK_MARKERS[i % len(FALLBACK_MARKERS)])
+    )
+    ax.errorbar(xs, means, yerr=stds if any(s > 0 for s in stds) else None,
+                fmt=f'{marker}-', color=color, capsize=4, label=name)
 
-napkin_colors = ['tomato', 'purple', 'gold']
-for i, (key, (t_no_mem, t_with_mem, t_non_hblk)) in enumerate(napkin_lines.items()):
-    m_val, d_val, k_val, b_val = key
-    names = ', '.join(seen_params[key])
-    color = napkin_colors[i % len(napkin_colors)]
-    ax.plot(N_model, t_no_mem, '--', color=color, linewidth=1.5,
-            label=f'Napkin compute-only  m={m_val}  [{names}]')
-    ax.plot(N_model, t_with_mem, ':', color=color, linewidth=2.0,
-            label=f'Napkin compute+mem   m={m_val}  [{names}]')
-    ax.plot(N_model, t_non_hblk, '-.', color=color, linewidth=1.5,
-            label=f'Napkin non-hblk      m={m_val}  [{names}]')
+if sweep_var == 'N':
+    ax.plot(N_model, t_no_mem,   '--', color='gray', linewidth=1.5, label='Napkin compute-only')
+    ax.plot(N_model, t_with_mem, ':',  color='gray', linewidth=2.0, label='Napkin compute+mem')
+    ax.plot(N_model, t_non_hblk, '-.', color='gray', linewidth=1.5, label='Napkin non-hblk')
 
-N_SMs = 132
-ax.axvline(N_SMs, color='gray', linestyle=':', linewidth=1)
-ax.text(N_SMs + 5, ax.get_ylim()[1] * 0.05 if ax.get_ylim()[1] > 0 else 1,
-        f'N={N_SMs}', color='gray', fontsize=9)
+    N_SMs = 132
+    ax.axvline(N_SMs, color='silver', linestyle=':', linewidth=1)
+    _, y_top = ax.get_ylim()
+    ax.text(N_SMs + 5, y_top * 0.05 if y_top > 0 else 1,
+            f'N={N_SMs}', color='gray', fontsize=9)
 
-ax.set_xlabel('N (number of datasets / league size)', fontsize=12)
+# axis labels and title
+if sweep_var == 'N':
+    fixed_str = f'm={m_val}  d={d_val}  k={k_val}  b={b_val}'
+    ax.set_xlabel('N (number of datasets / league size)', fontsize=12)
+    ax.set_title(f'KNN pipeline wall time vs N  |  {fixed_str}  |  GH200', fontsize=11)
+else:
+    n_fixed = N_val if N_val is not None else '?'
+    fixed_str = f'N={n_fixed}  m={m_val}  k={k_val}  b={b_val}'
+    ax.set_xlabel('d (feature dimension)', fontsize=12)
+    ax.set_title(f'KNN pipeline wall time vs d  |  {fixed_str}  |  GH200', fontsize=11)
+
 ax.set_ylabel('Wall time (ms)', fontsize=12)
-ax.set_title('KNN pipeline scaling comparison  |  GH200', fontsize=12)
 ax.set_yscale('log')
 ax.legend(fontsize=9)
 ax.grid(True, alpha=0.3, which='both')
 
 plt.tight_layout()
-plt.savefig('runtimes.png', dpi=150)
+out_png = filename.replace('.txt', '.png')
+plt.savefig(out_png, dpi=150)
 plt.show()
-print("Saved runtimes.png")
+print(f"Saved {out_png}")
 
 # -----------------------------
 # throughput summary
 # -----------------------------
-for name, fname, _color, _marker in pipelines:
-    if name not in all_data:
-        continue
-    params, data = all_data[name]
-    m_val, d_val, k_val, b_val = params['m'], params['d'], params['k'], params['b']
-    Ns = sorted(data.keys())
+for name in pipeline_names:
+    data = pipeline_data[name]
     print(f"\n--- {name}  (m={m_val}, d={d_val}, k={k_val}, b={b_val}) ---")
-    print(f"{'N':>6}  {'mean ms':>10}  {'datasets/s':>12}  {'napkin ms':>10}")
-    print("-" * 46)
-    for n in Ns:
-        mean_ms = np.mean(data[n])
-        dps     = n / (mean_ms / 1e3)
-        model   = mem_napkin_time_ms(n, m_val, d_val, k_val, b_val)
-        print(f"{n:>6}  {mean_ms:>10.1f}  {dps:>12.1f}  {model:>10.1f}")
+    if sweep_var == 'N':
+        print(f"{'N':>6}  {'mean ms':>10}  {'datasets/s':>12}  {'napkin ms':>10}")
+        print("-" * 46)
+        for x in sorted(data.keys()):
+            mean_ms = np.mean(data[x])
+            dps     = x / (mean_ms / 1e3)
+            model   = mem_napkin_time_ms(x, m_val, d_val, k_val, b_val)
+            print(f"{x:>6}  {mean_ms:>10.1f}  {dps:>12.1f}  {model:>10.1f}")
+    else:
+        n_fixed = N_val if N_val is not None else 1
+        print(f"{'d':>6}  {'mean ms':>10}  {'datasets/s':>12}")
+        print("-" * 34)
+        for x in sorted(data.keys()):
+            mean_ms = np.mean(data[x])
+            dps     = n_fixed / (mean_ms / 1e3)
+            print(f"{x:>6}  {mean_ms:>10.1f}  {dps:>12.1f}")
