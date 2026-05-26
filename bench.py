@@ -25,11 +25,10 @@ k = 2
 b = 32
 
 Ns           = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 132, 133, 144, 160, 192, 256, 384, 512, 640, 768, 896, 1024]
-Ns_large     = [1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384]
-N_fixed      = 500
-N_fixed_large = 4096
+Ns_large     = [1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384]
+N_fixed      = 1024
 ds           = [4, 8, 16, 32, 64, 128, 256, 512]
-ds_large     = [512, 768, 1024, 1536, 2048, 3072, 4096]
+ds_large     = [768, 1024, 1536, 2048, 3072, 4096]
 ALL_PIPELINES = ["knn_kokkos", "knn_kokkos_keqb", "unfused_knn_kokkos", "gemm_knn_kokkos", "cpp"]
 
 print(f"Benchmarking: {' '.join(args.pipeline)}  sweep={args.sweep}")
@@ -63,11 +62,11 @@ if args.pipeline == ["cpp"]:
             sys.exit("Compilation failed.")
 
     if args.sweep == "d":
-        sweep_vals = ds_large if args.large else ds
-        nf = N_fixed_large if args.large else N_fixed
+        sweep_vals = ds + ds_large if args.large else ds
+        nf = N_fixed
         hdr = [f"N={nf}", f"m={m}", f"k={k}", f"b={b}", "", "pipeline=cpp"]
     else:
-        sweep_vals = Ns_large if args.large else Ns
+        sweep_vals = Ns + Ns_large if args.large else Ns
         hdr = [f"m={m}", f"d={d}", f"k={k}", f"b={b}", "", "pipeline=cpp"]
     out_file = "runtimes.txt"
 
@@ -146,12 +145,12 @@ np.random.seed(0)
 pipeline_names = ALL_PIPELINES if "all" in args.pipeline else args.pipeline
 
 if args.sweep == "d":
-    sweep_vals = ds_large if args.large else ds
-    nf = N_fixed_large if args.large else N_fixed
+    sweep_vals = ds + ds_large if args.large else ds
+    nf = N_fixed
     lines    = [f"N={nf}", f"m={m}", f"k={k}", f"b={b}", ""]
     out_file = "runtimes.txt"
 else:
-    sweep_vals = Ns_large if args.large else Ns
+    sweep_vals = Ns + Ns_large if args.large else Ns
     nf = None
     lines    = [f"m={m}", f"d={d}", f"k={k}", f"b={b}", ""]
     out_file = "runtimes.txt"
