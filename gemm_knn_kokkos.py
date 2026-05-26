@@ -183,7 +183,8 @@ def flush_dloc(i, Dloc, b, m):
     Dloc[n][row][col] = -1.0
 
 
-def compute_dist_hblk_gemm(X, Xn, Dloc, b, hblk, blksize):
+def compute_dist_hblk_gemm(X, Xn, Dloc, b, hblk, blksize,
+                           X_cuda=None, Xn_cuda=None, Dloc_cuda=None):
     # Computes off-diagonal block distances via batched GEMM.
     # Block A (rows): X[:, start_i:start_i+b, :]        shape (N, b, d)
     # Block B (cols): X[:, start_j:start_j+blksize, :]  shape (N, blksize, d)
@@ -191,21 +192,27 @@ def compute_dist_hblk_gemm(X, Xn, Dloc, b, hblk, blksize):
     #   Dloc[n][jm][im] = ||X[n][start_i+im] - X[n][start_j+jm]||^2
     start_i = b * (hblk - 1)
     start_j = b * hblk
-    A = X[:, start_i:start_i + b, :]             # (N, b, d)
-    B = X[:, start_j:start_j + blksize, :]        # (N, blksize, d)
 
-    Xn_A = Xn[:, start_i:start_i + b]             # (N, b)
-    Xn_B = Xn[:, start_j:start_j + blksize]       # (N, blksize)
+    Xsrc  = X_cuda  if X_cuda  is not None else X
+    Xnsrc = Xn_cuda if Xn_cuda is not None else Xn
+    dst   = Dloc_cuda[:, :blksize, :b] if Dloc_cuda is not None else Dloc[:, :blksize, :b]
 
-    # Write dots directly into Dloc, then fix up in-place
-    out = Dloc[:, :blksize, :b]
-    torch.bmm(B, A.transpose(1, 2), out=out)       # out[n][jm][im] = B[n][jm] · A[n][im]
-    out.mul_(-2.0)
-    out.add_(Xn_A.unsqueeze(1))                    # + ||xi||^2, broadcast over jm
-    out.add_(Xn_B.unsqueeze(2))                    # + ||xj||^2, broadcast over im
+    A    = Xsrc[:, start_i:start_i + b, :]         # (N, b, d)
+    B    = Xsrc[:, start_j:start_j + blksize, :]   # (N, blksize, d)
+    Xn_A = Xnsrc[:, start_i:start_i + b]           # (N, b)
+    Xn_B = Xnsrc[:, start_j:start_j + blksize]     # (N, blksize)
+
+    torch.bmm(B, A.transpose(1, 2), out=dst)        # dst[n][jm][im] = B[n][jm] · A[n][im]
+    dst.mul_(-2.0)
+    dst.add_(Xn_A.unsqueeze(1))
+    dst.add_(Xn_B.unsqueeze(2))
+
+    if Dloc_cuda is not None:
+        Dloc[:, :blksize, :b].copy_(dst)            # D2H: result to CPU for PyKokkos topk
 
 
-def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
+def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx,
+                     X_cuda=None, Xn_cuda=None, Dloc_cuda=None):
     l = math.ceil(m / b)
 
     pk.parallel_for("norms", N * m, compute_norm, X=X, Xn=Xn, d=d, m=m)
@@ -236,7 +243,7 @@ def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
     for hblk in range(1, l):
         blksize = m - b * hblk
 
-        compute_dist_hblk_gemm(X, Xn, Dloc, b, hblk, blksize)
+        compute_dist_hblk_gemm(X, Xn, Dloc, b, hblk, blksize, X_cuda, Xn_cuda, Dloc_cuda)
 
         pk.parallel_for("Hblk_row_topk", N * b, topk_row_hblk,
                         Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b,

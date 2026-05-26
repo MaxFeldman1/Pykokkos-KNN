@@ -175,15 +175,12 @@ for pipeline_name in pipeline_names:
             Lidx = torch.full((run_N, m, k), -1,                             dtype=torch.int32)
             call_args = (run_N, m, run_d, k, eff_b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
 
-        if pipeline_name != "cpp":
-            dev  = torch.device('cuda')
-            X    = X.to(dev);    Xn   = Xn.to(dev);   Dloc = Dloc.to(dev)
-            Gdst = Gdst.to(dev); Gidx = Gidx.to(dev)
-            if pipeline_name == "knn_kokkos_keqb":
-                call_args = (run_N, m, run_d, k, eff_b, X, Xn, Dloc, Gdst, Gidx)
-            else:
-                Ldst = Ldst.to(dev); Lidx = Lidx.to(dev)
-                call_args = (run_N, m, run_d, k, eff_b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx)
+        if pipeline_name == "gemm_knn_kokkos":
+            dev       = torch.device('cuda')
+            X_cuda    = X.to(dev)
+            Xn_cuda   = Xn.to(dev)
+            Dloc_cuda = torch.empty_like(Dloc, device=dev)
+            call_args = call_args + (X_cuda, Xn_cuda, Dloc_cuda)
 
         for i in range(3):
             t0 = time.time()
