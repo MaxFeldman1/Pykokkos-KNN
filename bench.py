@@ -14,6 +14,8 @@ parser.add_argument("--sweep", default="N", choices=["N", "d"],
                     help="Variable to sweep: N (batch size) or d (dimension)")
 parser.add_argument("--large", action="store_true",
                     help="Use larger sweep values")
+parser.add_argument("--custom", type=int, nargs="+", metavar="VAL",
+                    help="Explicit list of sweep values, overrides --large")
 args = parser.parse_args()
 
 # -----------------------------
@@ -62,11 +64,11 @@ if args.pipeline == ["cpp"]:
             sys.exit("Compilation failed.")
 
     if args.sweep == "d":
-        sweep_vals = ds + ds_large if args.large else ds
+        sweep_vals = args.custom if args.custom else (ds + ds_large if args.large else ds)
         nf = N_fixed
         hdr = [f"N={nf}", f"m={m}", f"k={k}", f"b={b}", "", "pipeline=cpp"]
     else:
-        sweep_vals = Ns + Ns_large if args.large else Ns
+        sweep_vals = args.custom if args.custom else (Ns + Ns_large if args.large else Ns)
         hdr = [f"m={m}", f"d={d}", f"k={k}", f"b={b}", "", "pipeline=cpp"]
     out_file = "runtimes.txt"
 
@@ -123,8 +125,10 @@ def load_pipeline(name):
         def cpp_runner(run_N, m_, run_d, k_, *_ignored):
             result = subprocess.run(
                 [binary, str(run_N), str(m_), str(run_d), str(k_)],
-                check=True, capture_output=True, text=True,
+                capture_output=True, text=True,
             )
+            if result.returncode != 0:
+                raise RuntimeError(f"cpp_bench failed (N={run_N} m={m_} d={run_d}):\n{result.stderr.strip()}")
             return float(result.stdout.strip().splitlines()[-1])
         return cpp_runner, b
     elif name == "unfused_knn_kokkos":
@@ -145,12 +149,12 @@ np.random.seed(0)
 pipeline_names = ALL_PIPELINES if "all" in args.pipeline else args.pipeline
 
 if args.sweep == "d":
-    sweep_vals = ds + ds_large if args.large else ds
+    sweep_vals = args.custom if args.custom else (ds + ds_large if args.large else ds)
     nf = N_fixed
     lines    = [f"N={nf}", f"m={m}", f"k={k}", f"b={b}", ""]
     out_file = "runtimes.txt"
 else:
-    sweep_vals = Ns + Ns_large if args.large else Ns
+    sweep_vals = args.custom if args.custom else (Ns + Ns_large if args.large else Ns)
     nf = None
     lines    = [f"m={m}", f"d={d}", f"k={k}", f"b={b}", ""]
     out_file = "runtimes.txt"
@@ -188,11 +192,15 @@ for pipeline_name in pipeline_names:
             Dloc_cuda = torch.empty_like(Dloc, device=dev)
             call_args = call_args + (X_cuda, Xn_cuda, Dloc_cuda)
 
-        for i in range(3):
-            t0 = time.time()
-            ret = run_fn(*call_args)
-            t1 = time.time()
-            ms = ret if ret is not None else (t1 - t0) * 1000
+        try:
+            for i in range(3):
+                t0 = time.time()
+                ret = run_fn(*call_args)
+                t1 = time.time()
+                ms = ret if ret is not None else (t1 - t0) * 1000
+        except Exception as e:
+            print(f"{label}\nFAILED: {e}")
+            continue
         print(f"{label}\n{ms:.3f}")
 
         lines.append(label)
