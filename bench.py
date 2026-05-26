@@ -7,11 +7,13 @@ import torch
 import time
 
 parser = argparse.ArgumentParser()
-parser.add_argument("pipeline", nargs="?", default="knn_kokkos",
+parser.add_argument("pipeline", nargs="*", default=["knn_kokkos"],
                     choices=["knn_kokkos", "knn_kokkos_keqb", "unfused_knn_kokkos", "gemm_knn_kokkos", "cpp", "all"],
-                    help="Which pipeline to benchmark ('all' runs all Python pipelines)")
+                    help="Which pipeline(s) to benchmark ('all' runs all Python pipelines)")
 parser.add_argument("--sweep", default="N", choices=["N", "d"],
                     help="Variable to sweep: N (batch size) or d (dimension)")
+parser.add_argument("--large", action="store_true",
+                    help="Use larger sweep values")
 args = parser.parse_args()
 
 # -----------------------------
@@ -23,16 +25,19 @@ k = 2
 b = 32
 
 Ns           = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 132, 133, 144, 160, 192, 256, 384, 512, 640, 768, 896, 1024]
+Ns_large     = [1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384]
 N_fixed      = 500
+N_fixed_large = 4096
 ds           = [4, 8, 16, 32, 64, 128, 256, 512]
+ds_large     = [512, 768, 1024, 1536, 2048, 3072, 4096]
 ALL_PIPELINES = ["knn_kokkos", "knn_kokkos_keqb", "unfused_knn_kokkos", "gemm_knn_kokkos", "cpp"]
 
-print(f"Benchmarking: {args.pipeline}  sweep={args.sweep}")
+print(f"Benchmarking: {' '.join(args.pipeline)}  sweep={args.sweep}")
 
 # -----------------------------
 # cpp path: compile + subprocess
 # -----------------------------
-if args.pipeline == "cpp":
+if args.pipeline == ["cpp"]:
     knn_dir = os.path.dirname(os.path.abspath(__file__))
     binary  = os.path.join(knn_dir, "cpp_bench")
     src     = os.path.join(knn_dir, "cpp_bench.cu")
@@ -58,17 +63,17 @@ if args.pipeline == "cpp":
             sys.exit("Compilation failed.")
 
     if args.sweep == "d":
-        sweep_vals = ds
-        hdr = [f"N={N_fixed}", f"m={m}", f"k={k}", f"b={b}", "", "pipeline=cpp"]
-        out_file = "cpp_d_runtimes.txt"
+        sweep_vals = ds_large if args.large else ds
+        nf = N_fixed_large if args.large else N_fixed
+        hdr = [f"N={nf}", f"m={m}", f"k={k}", f"b={b}", "", "pipeline=cpp"]
     else:
-        sweep_vals = Ns
+        sweep_vals = Ns_large if args.large else Ns
         hdr = [f"m={m}", f"d={d}", f"k={k}", f"b={b}", "", "pipeline=cpp"]
-        out_file = "cpp_runtimes.txt"
+    out_file = "runtimes.txt"
 
     lines = hdr
     for val in sweep_vals:
-        run_N = N_fixed if args.sweep == "d" else val
+        run_N = nf if args.sweep == "d" else val
         run_d = val     if args.sweep == "d" else d
         result = subprocess.run(
             [binary, str(run_N), str(m), str(run_d), str(k)],
@@ -138,16 +143,18 @@ def load_pipeline(name):
 
 np.random.seed(0)
 
-pipeline_names = ALL_PIPELINES if args.pipeline == "all" else [args.pipeline]
+pipeline_names = ALL_PIPELINES if "all" in args.pipeline else args.pipeline
 
 if args.sweep == "d":
-    sweep_vals = ds
-    lines    = [f"N={N_fixed}", f"m={m}", f"k={k}", f"b={b}", ""]
-    out_file = ("all_d_runtimes.txt" if args.pipeline == "all" else "d_runtimes.txt")
+    sweep_vals = ds_large if args.large else ds
+    nf = N_fixed_large if args.large else N_fixed
+    lines    = [f"N={nf}", f"m={m}", f"k={k}", f"b={b}", ""]
+    out_file = "runtimes.txt"
 else:
-    sweep_vals = Ns
+    sweep_vals = Ns_large if args.large else Ns
+    nf = None
     lines    = [f"m={m}", f"d={d}", f"k={k}", f"b={b}", ""]
-    out_file = ("all_runtimes.txt" if args.pipeline == "all" else "runtimes.txt")
+    out_file = "runtimes.txt"
 
 for pipeline_name in pipeline_names:
     run_fn, eff_b = load_pipeline(pipeline_name)
@@ -155,7 +162,7 @@ for pipeline_name in pipeline_names:
     lines.append(f"pipeline={pipeline_name}")
 
     for val in sweep_vals:
-        run_N = N_fixed if args.sweep == "d" else val
+        run_N = nf if args.sweep == "d" else val
         run_d = val     if args.sweep == "d" else d
         label = f"d={val}" if args.sweep == "d" else f"N={val}"
 
