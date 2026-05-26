@@ -7,7 +7,6 @@ import math
 # -----------------------------
 # parameters
 # -----------------------------
-device = "cpu"
 
 if __name__ == '__main__':
     N = 2
@@ -207,70 +206,55 @@ def compute_dist_hblk_gemm(X, Xn, Dloc, b, hblk, blksize):
 
 
 def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
-    # Move all tensors to GPU so torch.bmm dispatches to cuBLAS and PyKokkos
-    # reads/writes stay on the same device with no page migration in the hblk loop.
-    dev  = torch.device('cuda')
-    X_g    = X.to(dev)
-    Xn_g   = Xn.to(dev)
-    Dloc_g = Dloc.to(dev)
-    Gdst_g = Gdst.to(dev)
-    Gidx_g = Gidx.to(dev)
-    Ldst_g = Ldst.to(dev)
-    Lidx_g = Lidx.to(dev)
-
     l = math.ceil(m / b)
 
-    pk.parallel_for("norms", N * m, compute_norm, X=X_g, Xn=Xn_g, d=d, m=m)
+    pk.parallel_for("norms", N * m, compute_norm, X=X, Xn=Xn, d=d, m=m)
     pk.fence()
 
     # diagonal blocks: distance + topk
     for blk in range(l):
         blksize = min((blk + 1) * b, m) - blk * b
         pk.parallel_for("Dblk_dist", pk.TeamPolicy(N * blksize, pk.AUTO),
-                        compute_dist_dblk, X=X_g, Xn=Xn_g, Dloc=Dloc_g, d=d, b=b,
+                        compute_dist_dblk, X=X, Xn=Xn, Dloc=Dloc, d=d, b=b,
                         blknum=blk, blksize=blksize)
 
     pk.fence()
 
     pk.parallel_for("Dblk_topk", N * m, topk_row_dblk,
-                    Dloc=Dloc_g, Lidx=Lidx_g, Ldst=Ldst_g, m=m, k=k, b=b)
+                    Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, m=m, k=k, b=b)
     pk.fence()
 
     pk.parallel_for("merge_diag", N * m, merge_topk,
-                    Gdst=Gdst_g, Gidx=Gidx_g, Ldst=Ldst_g, Lidx=Lidx_g, k=k, offset=0, count=m)
+                    Gdst=Gdst, Gidx=Gidx, Ldst=Ldst, Lidx=Lidx, k=k, offset=0, count=m)
     pk.fence()
 
-    pk.parallel_for("flush_local", N * m * (k + 1), flush_local, Ldst=Ldst_g, Lidx=Lidx_g, k=k, m=m)
-    pk.parallel_for("flush_dloc",  N * m * b,        flush_dloc,  Dloc=Dloc_g, b=b, m=m)
+    pk.parallel_for("flush_local", N * m * (k + 1), flush_local, Ldst=Ldst, Lidx=Lidx, k=k, m=m)
+    pk.parallel_for("flush_dloc",  N * m * b,        flush_dloc,  Dloc=Dloc, b=b, m=m)
     pk.fence()
 
-    # off-diagonal (hblk) loop — distances via batched GEMM (cuBLAS on GPU)
+    # off-diagonal (hblk) loop — distances via batched GEMM (cuBLAS)
     for hblk in range(1, l):
         blksize = m - b * hblk
 
-        compute_dist_hblk_gemm(X_g, Xn_g, Dloc_g, b, hblk, blksize)
+        compute_dist_hblk_gemm(X, Xn, Dloc, b, hblk, blksize)
 
         pk.parallel_for("Hblk_row_topk", N * b, topk_row_hblk,
-                        Dloc=Dloc_g, Lidx=Lidx_g, Ldst=Ldst_g, k=k, b=b,
+                        Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b,
                         blksize=blksize, blknum=hblk)
         pk.parallel_for("Hblk_col_topk", N * blksize, topk_col_hblk,
-                        Dloc=Dloc_g, Lidx=Lidx_g, Ldst=Ldst_g, k=k, b=b,
+                        Dloc=Dloc, Lidx=Lidx, Ldst=Ldst, k=k, b=b,
                         blknum=hblk, blksize=blksize)
         pk.fence()
 
         merge_count = m - b * (hblk - 1)
         pk.parallel_for("merge_hblk", N * merge_count, merge_topk,
-                        Gdst=Gdst_g, Gidx=Gidx_g, Ldst=Ldst_g, Lidx=Lidx_g,
+                        Gdst=Gdst, Gidx=Gidx, Ldst=Ldst, Lidx=Lidx,
                         k=k, offset=b * (hblk - 1), count=merge_count)
         pk.fence()
 
-        pk.parallel_for("flush_local", N * m * (k + 1), flush_local, Ldst=Ldst_g, Lidx=Lidx_g, k=k, m=m)
-        pk.parallel_for("flush_dloc",  N * m * b,        flush_dloc,  Dloc=Dloc_g, b=b, m=m)
+        pk.parallel_for("flush_local", N * m * (k + 1), flush_local, Ldst=Ldst, Lidx=Lidx, k=k, m=m)
+        pk.parallel_for("flush_dloc",  N * m * b,        flush_dloc,  Dloc=Dloc, b=b, m=m)
         pk.fence()
-
-    # Copy results back to caller's tensors (Xn/Dloc/Ldst/Lidx are intermediates)
-    Gdst.copy_(Gdst_g)
-    Gidx.copy_(Gidx_g)
 
 
 # -----------------------------
