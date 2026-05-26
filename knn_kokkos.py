@@ -48,11 +48,12 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
 
     # ---- Phase 1: norms ----
     def norm_body(i: int):
-        s: pk.float32 = 0.0
-        t: pk.int32 = 0
-        for t in range(d):
-            s += X[n][i][t] * X[n][i][t]
-        Xn[n][i] = s
+        def sq_fn(t: int, acc: pk.Acc[pk.float32]):
+            acc += X[n][i][t] * X[n][i][t]
+        s: pk.float32 = pk.parallel_reduce(pk.ThreadVectorRange(team_member, d), sq_fn)
+        def write_xn():
+            Xn[n][i] = s
+        pk.single(pk.PerThread(team_member), write_xn)
 
     pk.parallel_for(pk.TeamThreadRange(team_member, m), norm_body)
     team_member.team_barrier()
@@ -76,11 +77,12 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             im: pk.int32 = lin - start
             i: pk.int32 = im + b * blknum
             j: pk.int32 = jm + b * blknum
-            dot: pk.float32 = 0.0
-            t: pk.int32 = 0
-            for t in range(d):
-                dot += X[n][i][t] * X[n][j][t]
-            Dloc[n][i][jm] = -2.0 * dot + Xn[n][i] + Xn[n][j]
+            def dot_fn(t: int, acc: pk.Acc[pk.float32]):
+                acc += X[n][i][t] * X[n][j][t]
+            dot: pk.float32 = pk.parallel_reduce(pk.ThreadVectorRange(team_member, d), dot_fn)
+            def write_dloc():
+                Dloc[n][i][jm] = -2.0 * dot + Xn[n][i] + Xn[n][j]
+            pk.single(pk.PerThread(team_member), write_dloc)
 
         pk.parallel_for(pk.TeamThreadRange(team_member, n_pairs), dblk_body)
         team_member.team_barrier()
@@ -177,21 +179,22 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
             im_h: pk.int32 = 0
             for im_h in range(b):
                 i_h: pk.int32 = im_h + b * (hblk_i - 1)
-                dot: pk.float32 = 0.0
-                t: pk.int32 = 0
-                for t in range(d):
-                    dot += X[n][i_h][t] * X[n][j][t]
-                val: pk.float32 = -2.0 * dot + Xn[n][i_h] + Xn[n][j]
-                Dloc[n][jm][im_h] = val
-                worst_j: pk.int32 = 0
-                t_j: pk.int32 = 0
-                prop: pk.int32 = 0
-                for t_j in range(1, k):
-                    prop = Ldst[n][j][t_j] > Ldst[n][j][worst_j]
-                    worst_j = t_j * prop + worst_j * (1 - prop)
-                prop = val < Ldst[n][j][worst_j]
-                Ldst[n][j][worst_j] = val * prop + Ldst[n][j][worst_j] * (1 - prop)
-                Lidx[n][j][worst_j] = i_h * prop + Lidx[n][j][worst_j] * (1 - prop)
+                def dot_fn(t: int, acc: pk.Acc[pk.float32]):
+                    acc += X[n][i_h][t] * X[n][j][t]
+                dot: pk.float32 = pk.parallel_reduce(pk.ThreadVectorRange(team_member, d), dot_fn)
+                def do_write():
+                    val: pk.float32 = -2.0 * dot + Xn[n][i_h] + Xn[n][j]
+                    Dloc[n][jm][im_h] = val
+                    worst_j: pk.int32 = 0
+                    t_j: pk.int32 = 0
+                    prop: pk.int32 = 0
+                    for t_j in range(1, k):
+                        prop = Ldst[n][j][t_j] > Ldst[n][j][worst_j]
+                        worst_j = t_j * prop + worst_j * (1 - prop)
+                    prop = val < Ldst[n][j][worst_j]
+                    Ldst[n][j][worst_j] = val * prop + Ldst[n][j][worst_j] * (1 - prop)
+                    Lidx[n][j][worst_j] = i_h * prop + Lidx[n][j][worst_j] * (1 - prop)
+                pk.single(pk.PerThread(team_member), do_write)
 
         pk.parallel_for(pk.TeamThreadRange(team_member, blksize_h), hblk_col_body)
         team_member.team_barrier()
@@ -274,7 +277,7 @@ def knn_pipeline_kernel(team_member: pk.TeamMember,
 
 
 def run_knn_pipeline(N, m, d, k, b, X, Xn, Dloc, Gdst, Gidx, Ldst, Lidx):
-    policy = pk.TeamPolicy(N, pk.AUTO)
+    policy = pk.TeamPolicy(N, pk.AUTO, 32)
     pk.parallel_for(
         "MAIN_PIPELINE",
         policy,
