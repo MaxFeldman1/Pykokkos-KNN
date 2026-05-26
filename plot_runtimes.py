@@ -60,7 +60,8 @@ def parse_all_file(filename):
 
 
 def mem_napkin_time_ms(N, m_val, d_val, k_val, b_val,
-                   TFLOPS_TOTAL=33.5e12, HBM_BW=4e12, INCL_MEM=True):
+                   TFLOPS_TOTAL=33.5e12, HBM_BW=4e12, INCL_MEM=True,
+                   L2_MISS_RATE=None):
     pairs_per_ds = (m_val - 1) * m_val / 2
     flops_dist  = pairs_per_ds * (2 * d_val)
     flops_norms = m_val * (2 * d_val)
@@ -72,20 +73,28 @@ def mem_napkin_time_ms(N, m_val, d_val, k_val, b_val,
     if not INCL_MEM:
         return T_compute_ms
 
-    L2_MISS_RATE = 1
-
     l = int(np.ceil(m_val / b_val))
     hblk_pairs = sum(b_val * (m_val - b_val * h) for h in range(1, l))
 
-    total_bytes_per_ds = (
-        hblk_pairs * 2 * d_val * 8
-        + hblk_pairs * 2 * 8
-        + hblk_pairs * 8
-        + m_val * d_val * 8
-        + m_val * (k_val + 1) * 8 * 4
-    )
-
-    T_mem_ms = N * total_bytes_per_ds * L2_MISS_RATE / HBM_BW * 1e3
+    if L2_MISS_RATE is not None:
+        # Finite-cache model: full O(m²·d) access count scaled by miss rate.
+        total_bytes_per_ds = (
+            hblk_pairs * 2 * d_val * 8
+            + hblk_pairs * 2 * 8
+            + hblk_pairs * 8
+            + m_val * d_val * 8
+            + m_val * (k_val + 1) * 8 * 4
+        )
+        T_mem_ms = N * total_bytes_per_ds * L2_MISS_RATE / HBM_BW * 1e3
+    else:
+        # Infinite-cache (compulsory-miss only): each unique byte fetched from HBM once.
+        unique_bytes_per_ds = (
+            m_val * d_val * 8
+            + m_val * 8
+            + m_val * b_val * 8
+            + m_val * k_val * 8 * 4
+        )
+        T_mem_ms = N * unique_bytes_per_ds / HBM_BW * 1e3
 
     return T_compute_ms + T_mem_ms
 
@@ -160,17 +169,25 @@ print(f"Pipelines found: {pipeline_names}")
 print(f"Params: {params}")
 
 # -----------------------------
-# napkin math (N-sweep only)
+# napkin math
 # -----------------------------
 napkin_artists = []
+all_xs = sorted({x for name in pipeline_names for x in pipeline_data[name]})
 if sweep_var == 'N':
-    all_xs = sorted({x for name in pipeline_names for x in pipeline_data[name]})
     N_model = np.array(sorted(set(
         all_xs + list(range(1, max(all_xs) + 1, max(1, max(all_xs) // 200)))
     )))
-    t_no_mem   = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=False) for n in N_model])
-    t_with_mem = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=True)  for n in N_model])
-    t_non_hblk = np.array([non_hblk_napkin_time_ms(n, m_val, d_val, k_val, b_val)            for n in N_model])
+    t_no_mem   = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=False)                    for n in N_model])
+    t_with_mem = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=True)                     for n in N_model])
+    t_l2_mem   = np.array([mem_napkin_time_ms(n, m_val, d_val, k_val, b_val, INCL_MEM=True, L2_MISS_RATE=0.1)   for n in N_model])
+    t_non_hblk = np.array([non_hblk_napkin_time_ms(n, m_val, d_val, k_val, b_val)                               for n in N_model])
+else:
+    n_fixed_val = N_val if N_val is not None else 1
+    d_model = np.linspace(min(all_xs), max(all_xs), 400)
+    t_no_mem   = np.array([mem_napkin_time_ms(n_fixed_val, m_val, d, k_val, b_val, INCL_MEM=False)                   for d in d_model])
+    t_with_mem = np.array([mem_napkin_time_ms(n_fixed_val, m_val, d, k_val, b_val, INCL_MEM=True)                    for d in d_model])
+    t_l2_mem   = np.array([mem_napkin_time_ms(n_fixed_val, m_val, d, k_val, b_val, INCL_MEM=True, L2_MISS_RATE=0.1)  for d in d_model])
+    t_non_hblk = np.array([non_hblk_napkin_time_ms(n_fixed_val, m_val, d, k_val, b_val)                              for d in d_model])
 
 # -----------------------------
 # plot
@@ -202,10 +219,16 @@ for i, name in enumerate(pipeline_names):
                 fmt=f'{marker}-', color=color, capsize=5, label=name)
 
 if sweep_var == 'N':
-    ax.plot(N_model, t_no_mem,   '--', color='gray', linewidth=1.5, label='Napkin compute-only')
-    ax.plot(N_model, t_with_mem, ':',  color='gray', linewidth=2.0, label='Napkin compute+mem')
-    ax.plot(N_model, t_non_hblk, '-.', color='gray', linewidth=1.5, label='Napkin non-hblk')
+    x_model = N_model
+else:
+    x_model = d_model
 
+ax.plot(x_model, t_no_mem,   '--', color='gray',      linewidth=1.5, label='Napkin compute-only')
+ax.plot(x_model, t_with_mem, ':',  color='gray',      linewidth=2.0, label='Napkin compute+mem (∞ cache)')
+ax.plot(x_model, t_l2_mem,   '-',  color='lightgray', linewidth=1.5, label='Napkin compute+mem (L2 miss=0.1)')
+ax.plot(x_model, t_non_hblk, '-.', color='gray',      linewidth=1.5, label='Napkin non-hblk')
+
+if sweep_var == 'N':
     N_SMs = 132
     ax.axvline(N_SMs, color='silver', linestyle=':', linewidth=1)
     _, y_top = ax.get_ylim()
