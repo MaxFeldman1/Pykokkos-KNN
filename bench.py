@@ -26,9 +26,9 @@ b = 32
 
 Ns           = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 132, 133, 144, 160, 192, 256, 384, 512, 640, 768, 896, 1024]
 Ns_large     = [1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384]
-N_fixed      = 1024
+N_fixed      = 512
 ds           = [4, 8, 16, 32, 64, 128, 256, 512]
-ds_large     = [768, 1024, 1536, 2048, 3072, 4096]
+ds_large     = [1024, 2048, 4096]
 ALL_PIPELINES = ["knn_kokkos", "knn_kokkos_keqb", "unfused_knn_kokkos", "gemm_knn_kokkos", "cpp"]
 
 print(f"Benchmarking: {' '.join(args.pipeline)}  sweep={args.sweep}")
